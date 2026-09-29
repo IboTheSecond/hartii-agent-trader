@@ -198,3 +198,74 @@ that. `isTradeable()` in `src/tools` currently excludes rows where `tradeable ==
 flagged, delisted, banned, rugged, paused, blocked`. If the real API uses different field
 names/values for this, update `isTradeable()` in `src/tools/index.mjs` — it's a single small
 function, no other module depends on its internals.
+
+---
+
+## From: `src/runner` + `src/report` + `src/sim` + `bin/` (2026-09-29)
+
+### 1. Created `bin/mcp-server.mjs` — confirming the shape `src/agents`/`src/tools` assumed
+
+Per the `src/agents` entry above and its `src/tools` reply, `bin/mcp-server.mjs` now exists:
+`node bin/mcp-server.mjs --role <role>` builds a `ToolCtx` (api/provider/wallet/vault/config +
+the `ledger`/`ledgerApi`/`paperEngine` fields `src/tools` documented needing), filters
+`buildReadOnlyTools`/`buildTradeTools`'s output to `resolveAllowlist(role, config)` (belt-and-
+braces, even though those builders already return a role-appropriate-ish set), and serves it
+over stdio via `createMcpServer(tools, { name: 'hartii-agent' })` + `serveStdio`. No response
+needed unless something about this doesn't match what a real spawn needs — nothing outside this
+file's own tests has exercised it end-to-end yet (blocked on `src/config#loadConfig` still being
+a stub as of this writing — see item 5 below).
+
+### 2. `src/agents`' spawn options default `mcpServerEnv` to `{}`, not "inherit" — `src/runner` now passes `process.env` explicitly
+
+`spawnSandboxedSession`'s `opts.mcpServerEnv = {}` default means a spawned `bin/mcp-server.mjs`
+subprocess would see none of `HARTII_VAULT_ADDRESS`/`HARTII_AGENT_KEY_FILE`/`TELEGRAM_*`/etc.
+unless something passes them through explicitly. `src/runner#runCycle` now calls
+`runAnalystsInParallel(input, { mcpServerEnv: process.env })` and
+`runDecider(input, { mcpServerEnv: process.env })` — every env var this process has, forwarded
+as-is. If `claude -p`'s own mcp-config `env` handling merges with the parent's environment
+rather than replacing it, this is redundant but harmless; if it replaces, it's required. No
+action needed unless this assumption is wrong.
+
+### 3. Paper mode never reads a real vault for portfolio/holdings/capital-exhausted — the ledger is authoritative instead
+
+`src/tools`' own `executeGuardedTrade`/`hartii_status` still call `ctx.api.getVault(ctx.vault)`
+even in paper mode (for portfolio-fraction guard sizing and status reporting) — see that
+module's entries above. `src/runner` deliberately does **not** mirror that for its own
+`AnalystInput`/`DeciderInput`/`status.json` construction: a real vault's live balance is not
+"the paper portfolio" (nothing paper touches it), so `runCycle`/`shouldStop` derive
+`portfolio`/`holdings` from `ctx.ledger` in paper mode instead
+(`src/sim#derivePaperPortfolioFromLedger`, new export — cash = deposits − buys + sells − gas;
+positions straight from `ledger.positions`). Holding mark values are estimated from each
+token's `lastPriceWei` already present in the same `getTokens()` call `market` comes from —
+deliberately not an extra live quote per holding.
+
+**Known residual gap (documented, not fixed here — not this module's file to fix):** because
+`src/tools`' `hartii_status`/`hartii_buy`/`hartii_sell` still read the real vault even in paper
+mode, a sandboxed session's own direct tool calls can disagree with the ledger-accurate context
+`src/runner` embeds in its prompt (`AnalystInput.portfolio`/`holdings`) — most visibly, a *pure*
+paper session with no `HARTII_VAULT_ADDRESS` configured at all will see `hartii_status` return
+`{ ok: false, error: 'ctx.vault is not configured' }`, and `hartii_buy`/`hartii_sell` will call
+`ctx.api.getVault(undefined)` for their own internal `fullPortfolioQuaiWei` guard-sizing (which
+will fail against a real API). **Recommend paper rehearsals configure a real (even unfunded)
+`HARTII_VAULT_ADDRESS`** until `src/tools` reconciles its own paper-mode awareness for those
+three tools — flagging this rather than changing `src/tools` myself, since it isn't this
+module's file. README's Running section now says so.
+
+### 4. `src/sim#createPaperEngine` gained an additive optional `initialPositions` field
+
+Needed so `bin/mcp-server.mjs` can seed a freshly-constructed `PaperEngine` (a brand new one
+every subprocess spawn — stdio MCP servers don't persist across process boundaries) with
+whatever a session already holds per the ledger, so a decider can `hartii_sell` an existing
+paper position instead of every fresh subprocess starting "empty" regardless of ledger state.
+Purely additive to the pinned `createPaperEngine({initialQuaiWei, api})` signature — existing
+callers are unaffected. No action needed from any other module; noted here for visibility since
+`src/sim` is this same entry's author.
+
+### 5. Status check: `src/config#loadConfig`/`#getAgentKeyMaterial` are the last blocking stub as of 2026-09-29 (this writing)
+
+Every other `src/*` module (`chain`, `data`, `guard`, `ledger`, `tools`, `agents`) had no
+remaining `not implemented` call sites at the time this was written. `bin/run.mjs --once --paper`
+run for real fails at `src/config: loadConfig not implemented` — the only reason the harness
+can't be smoke-tested fully end-to-end right now. No action needed beyond finishing that module;
+noted here only so the status is stated plainly rather than implied.
+function, no other module depends on its internals.
