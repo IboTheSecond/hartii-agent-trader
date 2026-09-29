@@ -310,10 +310,34 @@ test('tools: hartii_buy executes a paper fill via ctx.paperEngine and reports cl
   assert.equal(result.ok, true);
   assert.equal(result.clipped, true);
   assert.equal(result.amountInWei, '500000000000000000');
+  assert.equal(result.amountOutWei, '500', 'the paper engine\'s actual filledTokensWei must be surfaced, never left at 0/null on a success');
   assert.equal(result.txHash, null);
   assert.ok(result.warnings.length >= 1);
   assert.equal(paperCallArgs.amountInWei, 500000000000000000n);
   assert.equal(paperCallArgs.minTokensOutWei, 500n, 'minTokensOutWei must be rescaled proportionally to the clip');
+});
+
+test('tools: hartii_sell surfaces the paper engine\'s actual filledQuaiWei as amountOutWei', async () => {
+  const paperEngine = { async sell() { return { ok: true, filledQuaiWei: 777n }; } };
+  const ctx = { api: makeFakeApi(), config: { paperMode: true }, provider: {}, vault: VAULT, chain: makeFakeChain(), guard: makeFakeGuard(), paperEngine };
+  const tools = buildTradeTools(ctx);
+  const result = await findTool(tools, 'hartii_sell').handler({ token: TOKEN, tokensInWei: '1000', minQuaiOutWei: '1' });
+  assert.equal(result.ok, true);
+  assert.equal(result.amountOutWei, '777');
+});
+
+test('tools: hartii_buy in live mode surfaces gasWei from the receipt but leaves amountOutWei null (no event-log decoder yet)', async () => {
+  const chain = makeFakeChain({
+    async sendVaultExecute() {
+      return { txHash: '0xdeadbeef', receipt: { status: true, gasUsedWei: 12345n, txHash: '0xdeadbeef', logs: [] } };
+    },
+  });
+  const ctx = { api: makeFakeApi(), config: { paperMode: false }, provider: {}, vault: VAULT, wallet: { address: AGENT }, chain, guard: makeFakeGuard() };
+  const tools = buildTradeTools(ctx);
+  const result = await findTool(tools, 'hartii_buy').handler({ token: TOKEN, amountInWei: '1000000000000000000', minTokensOutWei: '1' });
+  assert.equal(result.ok, true);
+  assert.equal(result.gasWei, '12345');
+  assert.equal(result.amountOutWei, null);
 });
 
 test('tools: hartii_buy in paper mode without ctx.paperEngine returns a clear error, never throws', async () => {
@@ -414,6 +438,149 @@ test('tools: hartii_sell passes valueOfProposedWei from the live sell quote into
   const tools = buildTradeTools(ctx);
   await findTool(tools, 'hartii_sell').handler({ token: TOKEN, tokensInWei: '1000', minQuaiOutWei: '1' });
   assert.equal(guardSellCtx.valueOfProposedWei, 900000000000000000n);
+});
+
+// --- paper mode with NO vault configured at all (INTERFACE-REQUESTS.md item 3) ---------------
+
+test('tools: hartii_status in paper mode with no vault derives state from ctx.paperEngine, never reads the live vault', async () => {
+  const api = makeFakeApi({
+    async getVault() {
+      throw new Error('must never be called — paper mode with no vault must not touch the live vault');
+    },
+    async getQuote({ token, amountWei }) {
+      return { amountOut: (BigInt(amountWei) * 2n).toString(), priceImpact: 0 };
+    },
+  });
+  const paperEngine = { getState: () => ({ quaiWei: 500n, positions: { [TOKEN]: 10n } }) };
+  const ctx = { api, config: { paperMode: true }, provider: {}, vault: null, paperEngine };
+  const tools = buildReadOnlyTools(ctx);
+  const result = await findTool(tools, 'hartii_status').handler({});
+  assert.equal(result.ok, true);
+  assert.equal(result.quaiBalanceWei, '500');
+  assert.equal(result.holdings.length, 1);
+  assert.equal(result.holdings[0].token, TOKEN);
+  assert.equal(result.holdings[0].amountWei, '10');
+  assert.equal(result.holdings[0].markValueQuaiWei, '20'); // fake getQuote doubles amountWei
+  assert.equal(result.paused, false);
+});
+
+test('tools: hartii_status in paper mode with no vault and no paperEngine returns a clean error, never throws', async () => {
+  const ctx = { api: makeFakeApi(), config: { paperMode: true }, provider: {}, vault: null };
+  const tools = buildReadOnlyTools(ctx);
+  const result = await findTool(tools, 'hartii_status').handler({});
+  assert.equal(result.ok, false);
+  assert.match(result.error, /paperEngine/);
+});
+
+test('tools: hartii_status in paper mode with no vault degrades a failed mark quote to 0 instead of throwing', async () => {
+  const api = makeFakeApi({ async getQuote() { throw new Error('quote service down'); } });
+  const paperEngine = { getState: () => ({ quaiWei: 1n, positions: { [TOKEN]: 10n } }) };
+  const ctx = { api, config: { paperMode: true }, provider: {}, vault: null, paperEngine };
+  const tools = buildReadOnlyTools(ctx);
+  const result = await findTool(tools, 'hartii_status').handler({});
+  assert.equal(result.ok, true);
+  assert.equal(result.holdings[0].markValueQuaiWei, '0');
+});
+
+test('tools: hartii_buy in paper mode with no vault configured executes via ctx.paperEngine using the documented gas-estimate fallback', async () => {
+  let guardCtxSeen = null;
+  const guard = makeFakeGuard({
+    guardBuy(args, gctx) {
+      guardCtxSeen = gctx;
+      return { ok: true, clipped: false, amountInWei: args.amountInWei };
+    },
+  });
+  const paperEngine = {
+    getState: () => ({ quaiWei: 10n ** 21n, positions: {} }),
+    async buy() { return { ok: true, filledTokensWei: 1000n }; },
+  };
+  const chain = makeFakeChain({
+    // Neither of these should ever be called with no vault to preview a real send against.
+    buildVaultExecuteCalldata() { throw new Error('must not be called — no vault configured'); },
+    async estimateGasWei() { throw new Error('must not be called — no vault configured'); },
+  });
+  const ctx = { api: makeFakeApi(), config: { paperMode: true }, provider: {}, vault: null, chain, guard, paperEngine };
+  const tools = buildTradeTools(ctx);
+  const result = await findTool(tools, 'hartii_buy').handler({ token: TOKEN, amountInWei: '1000000000000000000', minTokensOutWei: '1' });
+  assert.equal(result.ok, true);
+  assert.equal(guardCtxSeen.estimatedGasCostWei, 4n * 10n ** 18n);
+});
+
+test('tools: hartii_buy in paper mode with no vault and no paperEngine returns a clean error, never a generic crash', async () => {
+  const ctx = { api: makeFakeApi(), config: { paperMode: true }, provider: {}, vault: null, chain: makeFakeChain(), guard: makeFakeGuard() };
+  const tools = buildTradeTools(ctx);
+  const result = await findTool(tools, 'hartii_buy').handler({ token: TOKEN, amountInWei: '1000000000000000000', minTokensOutWei: '1' });
+  assert.equal(result.ok, false);
+  assert.equal(result.error, 'paper mode requires ctx.paperEngine to be wired');
+});
+
+test('tools: hartii_buy in LIVE mode with no vault configured is rejected up front (unchanged pre-existing behavior)', async () => {
+  const ctx = { api: makeFakeApi(), config: { paperMode: false }, provider: {}, vault: null, chain: makeFakeChain(), guard: makeFakeGuard() };
+  const tools = buildTradeTools(ctx);
+  const result = await findTool(tools, 'hartii_buy').handler({ token: TOKEN, amountInWei: '1000000000000000000', minTokensOutWei: '1' });
+  assert.equal(result.ok, false);
+  assert.equal(result.error, 'ctx.vault is not configured');
+});
+
+// --- computePriceImpactPct fallback (the live /api/agent/quote endpoint has no priceImpact
+// field at all — see INTERFACE-REQUESTS.md's integration entry) --------------------------------
+
+test('tools: hartii_buy computes priceImpactPct from spot price when the quote has none, and passes it to guardBuy', async () => {
+  let guardArgsSeen = null;
+  const guard = makeFakeGuard({
+    guardBuy(args, gctx) {
+      guardArgsSeen = args;
+      return { ok: true, clipped: false, amountInWei: args.amountInWei };
+    },
+  });
+  // Quote (no priceImpact field, matching the real API): 1 QUAI buys 900 tokens (avg price
+  // ~1.111e15 QUAI-wei per token-wei-1e18-scaled). Spot price (lastPriceWei) is lower, at 1e15,
+  // so the fill is worse than spot by a computable, positive percentage.
+  const api = makeFakeApi({
+    async getQuote() { return { amountOut: '900', priceImpact: undefined }; },
+    async getToken() { return { lastPriceWei: '1000000000000000' }; },
+  });
+  const ctx = { api, config: { paperMode: true }, provider: {}, vault: VAULT, chain: makeFakeChain(), guard, paperEngine: { buy: async () => ({ ok: true }) } };
+  const tools = buildTradeTools(ctx);
+  const result = await findTool(tools, 'hartii_buy').handler({ token: TOKEN, amountInWei: '1000000000000000000', minTokensOutWei: '1' });
+  assert.equal(result.ok, true);
+  assert.ok(Number.isFinite(guardArgsSeen.priceImpactPct));
+  assert.ok(guardArgsSeen.priceImpactPct > 0);
+});
+
+test('tools: hartii_buy fails closed (NaN priceImpactPct, guard rejects) when spot price is unavailable, never assumes 0%', async () => {
+  let guardArgsSeen = null;
+  const guard = makeFakeGuard({
+    guardBuy(args) {
+      guardArgsSeen = args;
+      return Number.isFinite(args.priceImpactPct)
+        ? { ok: true, clipped: false, amountInWei: args.amountInWei }
+        : { ok: false, reason: 'price impact is not a finite number' };
+    },
+  });
+  const api = makeFakeApi({
+    async getQuote() { return { amountOut: '900' }; }, // no priceImpact field
+    async getToken() { throw new Error('token detail service down'); },
+  });
+  const ctx = { api, config: { paperMode: true }, provider: {}, vault: VAULT, chain: makeFakeChain(), guard, paperEngine: { buy: async () => ({ ok: true }) } };
+  const tools = buildTradeTools(ctx);
+  const result = await findTool(tools, 'hartii_buy').handler({ token: TOKEN, amountInWei: '1000000000000000000', minTokensOutWei: '1' });
+  assert.equal(result.ok, false);
+  assert.ok(Number.isNaN(guardArgsSeen.priceImpactPct));
+});
+
+test('tools: hartii_buy trusts an explicit numeric quote.priceImpact over the derived estimate (no extra getToken call)', async () => {
+  let getTokenCalled = false;
+  const guard = makeFakeGuard();
+  const api = makeFakeApi({
+    async getQuote() { return { amountOut: '900', priceImpact: 2.5 }; },
+    async getToken() { getTokenCalled = true; return {}; },
+  });
+  const ctx = { api, config: { paperMode: true }, provider: {}, vault: VAULT, chain: makeFakeChain(), guard, paperEngine: { buy: async () => ({ ok: true }) } };
+  const tools = buildTradeTools(ctx);
+  const result = await findTool(tools, 'hartii_buy').handler({ token: TOKEN, amountInWei: '1000000000000000000', minTokensOutWei: '1' });
+  assert.equal(result.ok, true);
+  assert.equal(getTokenCalled, false);
 });
 
 test('tools: hartii_launch_token blocks a non-approved image URL via the launch gate', async () => {

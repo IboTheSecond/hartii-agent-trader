@@ -167,11 +167,13 @@ node bin/keygen.mjs --out state/agent.key
 # -> prints only the address. Fund THAT address with a little QUAI for gas once you're ready
 #    for live mode; paper mode needs none of this.
 
-# 2. Copy .env.example -> .env, fill in HARTII_VAULT_ADDRESS / TELEGRAM_* / NTFY_URL as desired.
+# 2. Copy .env.example -> .env, fill in TELEGRAM_* / NTFY_URL as desired.
 #    HARTII_PAPER=1 by default in .env.example — leave it set until you've watched a paper
-#    session behave the way you expect. Configure a real (even unfunded) HARTII_VAULT_ADDRESS
-#    even for paper rehearsals — the guarded trade tools currently read live vault state for
-#    portfolio-sizing context regardless of mode; see INTERFACE-REQUESTS.md item 3.
+#    session behave the way you expect. HARTII_VAULT_ADDRESS is optional in paper mode (nothing
+#    paper does ever touches the real vault) — a brand new paper session auto-seeds a simulated
+#    starting balance on its first run. Configuring a real (even unfunded) vault address anyway
+#    gets you real on-chain gas estimates instead of an approximate fallback; see
+#    INTERFACE-REQUESTS.md item 3 for the full paper-mode-without-a-vault design.
 
 node bin/run.mjs --paper --once   # one paper cycle, prints the cycle result as JSON
 node bin/run.mjs --paper --loop   # continuous paper session (jittered ~20-60s between cycles)

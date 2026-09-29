@@ -394,8 +394,20 @@ export async function runCycle(ctx) {
     const cap = ctx.config.maxActionsPerCycle;
     const actions = Number.isFinite(cap) ? (deciderResult.actions || []).slice(0, cap) : deciderResult.actions || [];
 
-    // 6. Record + report each executed action.
+    // 6. Record + report each executed action. `portfolio`/`holdings` above are (deliberately)
+    // the start-of-cycle snapshot the analysts/decider actually reasoned against — left
+    // unchanged. `livePortfolio`/`liveHoldings` track what this cycle's own trades have done so
+    // far: in paper mode, cheaply recomputed from the ledger after each recorded trade (pure
+    // math, no I/O) so a cycle's 2nd/3rd action's own report — and this cycle's final
+    // status.json — reflect what already happened this cycle, not a stale pre-cycle balance
+    // (confirmed live: a real paper buy's own report showed the PRE-trade QUAI balance,
+    // unchanged by the trade it was reporting — see INTERFACE-REQUESTS.md's integration entry).
+    // Live mode keeps one point-in-time vault read for the whole cycle, unchanged from before —
+    // re-reading the real vault after every action is a live-mode-only cost/latency tradeoff not
+    // exercised by this pass.
     let ledger = ctx.ledger;
+    let liveHoldings = holdings;
+    let livePortfolio = portfolio;
     for (const action of actions) {
       if (!action || action.ok !== true) continue; // only executed actions become ledger entries
       const trade = buildTradeRecord({ action, market, atMs: deps.now(), paperMode, fallbackReason: deciderResult.reasoning });
@@ -408,7 +420,11 @@ export async function runCycle(ctx) {
         safeConsoleError(`recordTrade failed for ${trade.token}`, err);
         continue; // don't let one bad record block reporting/saving the rest of the cycle
       }
-      const snapshot = buildSnapshot(ledger, portfolio, holdings, deps);
+      if (paperMode) {
+        liveHoldings = buildPaperHoldings(ledger, market);
+        livePortfolio = buildPaperPortfolio(ledger, liveHoldings, deps);
+      }
+      const snapshot = buildSnapshot(ledger, livePortfolio, liveHoldings, deps);
       await safeReportTrade(ctx.reporter, trade, snapshot);
     }
     ctx.ledger = ledger; // carry forward so a runLoop's next iteration sees this cycle's trades
@@ -419,7 +435,7 @@ export async function runCycle(ctx) {
       safeConsoleError('saveLedger failed', err);
     }
 
-    return finish({ ...deciderResult, actions }, {}, portfolio);
+    return finish({ ...deciderResult, actions }, {}, livePortfolio);
   } catch (err) {
     const msg = err?.message || String(err);
     await safeReportBlocked(ctx.reporter, `cycle error: ${msg}`);

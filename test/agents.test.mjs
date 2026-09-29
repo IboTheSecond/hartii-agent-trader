@@ -26,22 +26,31 @@ import { TOOL_ALLOWLISTS } from '../src/tools/index.mjs';
 
 // Every test injects a fake spawnImpl; never actually spawn `claude -p` from `node --test`.
 // The fake mimics node:child_process's ChildProcess surface just enough for this module: a
-// `.stdout`/`.stderr` EventEmitter pair, an `.on('close'|'error', ...)` on the child itself, and
-// a no-op `.kill()`.
+// `.stdout`/`.stderr` EventEmitter pair, an `.on('close'|'error', ...)` on the child itself, a
+// no-op `.kill()`, and a `.stdin` (the task prompt is written here, never as an argv element —
+// see src/agents#buildClaudeArgv's header comment) that records what was written/whether it was
+// closed rather than being a real stream.
 
 function fakeChild() {
   const child = new EventEmitter();
   child.stdout = new EventEmitter();
   child.stderr = new EventEmitter();
   child.kill = () => {};
+  child.stdin = new EventEmitter();
+  child.stdin.written = '';
+  child.stdin.ended = false;
+  child.stdin.end = (data, _enc) => {
+    if (typeof data === 'string') child.stdin.written += data;
+    child.stdin.ended = true;
+  };
   return child;
 }
 
 /** A spawnImpl that immediately (next microtask) writes stdout and closes with exit code 0. */
 function spawnThatSucceeds(stdout, { captureArgs } = {}) {
   return (command, args, options) => {
-    if (captureArgs) captureArgs({ command, args, options });
     const child = fakeChild();
+    if (captureArgs) captureArgs({ command, args, options, child });
     queueMicrotask(() => {
       child.stdout.emit('data', Buffer.from(stdout, 'utf8'));
       child.emit('close', 0);
@@ -244,6 +253,44 @@ test('agents: parseDeciderOutput accepts a valid DeciderResult with actions', ()
   assert.equal(result.skipped, null);
 });
 
+test('agents: parseDeciderOutput accepts and preserves the additive fill-detail fields (amountOutWei etc.)', () => {
+  const raw = JSON.stringify({
+    actions: [{
+      token: TOKEN_A, side: 'buy', amountWei: '25000000000000000000', amountOutWei: '999000',
+      priceQuaiPerTokenWei: '25025025', gasWei: '900', symbol: 'ART', reason: 'strong momentum',
+      txHash: TX_HASH, ok: true, warnings: [],
+    }],
+    reasoning: 'strong volume, sized within guard limits',
+    skipped: null,
+  });
+  const result = parseDeciderOutput(raw);
+  assert.equal(result.actions[0].amountOutWei, '999000');
+  assert.equal(result.actions[0].priceQuaiPerTokenWei, '25025025');
+  assert.equal(result.actions[0].gasWei, '900');
+  assert.equal(result.actions[0].symbol, 'ART');
+  assert.equal(result.actions[0].reason, 'strong momentum');
+});
+
+test('agents: parseDeciderOutput accepts a null amountOutWei (e.g. an unexercised live fill) without throwing', () => {
+  const raw = JSON.stringify({
+    actions: [{ token: TOKEN_A, side: 'buy', amountWei: '1', amountOutWei: null, txHash: TX_HASH, ok: true, warnings: [] }],
+    reasoning: 'x',
+    skipped: null,
+  });
+  const result = parseDeciderOutput(raw);
+  assert.equal(result.actions[0].amountOutWei, null);
+});
+
+test('agents: parseDeciderOutput still accepts the original minimal action shape with none of the additive fields', () => {
+  const raw = JSON.stringify({
+    actions: [{ token: TOKEN_A, side: 'buy', amountWei: '1', txHash: TX_HASH, ok: true, warnings: [] }],
+    reasoning: 'x',
+    skipped: null,
+  });
+  const result = parseDeciderOutput(raw);
+  assert.equal(result.actions.length, 1);
+});
+
 test('agents: parseDeciderOutput accepts a skip (empty actions, non-null reason)', () => {
   const raw = JSON.stringify({ actions: [], reasoning: 'nothing cleared the bar this cycle', skipped: 'no setup cleared the bar' });
   const result = parseDeciderOutput(raw);
@@ -291,6 +338,17 @@ test('agents: runAnalyst spawns claude, writes an mcp-config, and returns valida
     assert.equal(proposals[0].token, TOKEN_A);
 
     assert.equal(captured.command, 'claude');
+    // The task prompt travels over stdin, never as an argv element (Windows' ~32K total
+    // command-line length is easily exceeded by a real market snapshot — see
+    // src/agents#buildClaudeArgv's header comment and INTERFACE-REQUESTS.md's integration entry
+    // on the "spawn ENAMETOOLONG" this fixes).
+    assert.ok(captured.args.includes('-p'));
+    assert.ok(
+      !captured.args.some((a) => a.includes('MARKET SNAPSHOT')),
+      'the task text must never appear as an argv element',
+    );
+    assert.equal(captured.child.stdin.ended, true);
+    assert.match(captured.child.stdin.written, /MARKET SNAPSHOT/);
     assert.ok(captured.args.includes('--model'));
     assert.ok(captured.args.includes('haiku'));
     assert.ok(captured.args.includes('--strict-mcp-config'));

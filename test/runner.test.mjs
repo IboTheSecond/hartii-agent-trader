@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { runCycle, runLoop, shouldStop, writeStatus, readStatus, DEFAULT_PAUSE_MIN_MS, DEFAULT_PAUSE_MAX_MS } from '../src/runner/index.mjs';
+import * as realLedgerModule from '../src/ledger/index.mjs';
 
 const QUAI = 10n ** 18n;
 const TOKEN = '0x000000000000000000000000000000000000aa';
@@ -191,6 +192,35 @@ test('runCycle: happy path runs analysts + decider, records executed trades, and
   assert.equal(trade.paper, true);
   assert.equal(snapshot.realizedPnlWei, (1n * QUAI).toString());
   assert.ok(ctx.ledger.trades.length === 1); // ctx.ledger carried forward for the next cycle
+});
+
+test('runCycle: in paper mode, a trade\'s own reported snapshot reflects the balance AFTER that trade, not the stale pre-cycle balance', async () => {
+  // Uses the real src/ledger + src/sim modules (pure, no I/O) instead of the fake — the fake's
+  // recordTrade never updated .positions/derived balances, which is exactly what would have
+  // masked this bug (confirmed live: a real run's trade report showed the pre-trade QUAI balance
+  // unchanged by the trade it was reporting — see INTERFACE-REQUESTS.md's integration entry).
+  const decider = {
+    actions: [{ token: TOKEN, side: 'buy', amountWei: (100n * QUAI).toString(), amountOutWei: (50n * QUAI).toString(), txHash: null, ok: true, warnings: [] }],
+    reasoning: 'strong signal',
+    skipped: null,
+  };
+  const { ctx, reported, io } = baseCtx({
+    deps: { ledger: realLedgerModule, agents: fakeAgentsModule({ deciderResult: decider }) },
+  });
+
+  await runCycle(ctx);
+
+  assert.equal(reported.trades.length, 1);
+  const { snapshot } = reported.trades[0];
+  // Started at 1000 QUAI deposited (baseCtx's default), spent 100 QUAI on this buy: 900 left —
+  // never the stale pre-trade 1000.
+  assert.equal(snapshot.quaiWei, (900n * QUAI).toString());
+  assert.equal(snapshot.holdings.length, 1);
+  assert.equal(snapshot.holdings[0].amountWei, (50n * QUAI).toString());
+
+  // The cycle's own final status.json must agree — not lag one cycle behind.
+  const status = JSON.parse(await io.readStatusImpl(ctx.config.statusFile));
+  assert.equal(status.portfolio.quaiWei, (900n * QUAI).toString());
 });
 
 test('runCycle: an unexecuted (ok:false) action is never recorded as a trade', async () => {

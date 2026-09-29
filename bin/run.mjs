@@ -20,9 +20,10 @@ import { Wallet } from 'quais';
 import { loadConfig, getAgentKeyMaterial } from '../src/config/index.mjs';
 import { createApiClient } from '../src/data/index.mjs';
 import { getProvider } from '../src/chain/index.mjs';
-import { loadLedger } from '../src/ledger/index.mjs';
+import { loadLedger, recordDeposit, saveLedger } from '../src/ledger/index.mjs';
 import { createReporter } from '../src/report/index.mjs';
 import { runCycle, runLoop } from '../src/runner/index.mjs';
+import { DEFAULT_PAPER_STARTING_QUAI_WEI } from '../src/sim/index.mjs';
 
 export function parseArgs(argv) {
   const args = { help: false, once: false, loop: false, paper: false, live: false, dryRun: false };
@@ -92,6 +93,40 @@ function stringifyResult(result) {
   return JSON.stringify(result, (_key, value) => (typeof value === 'bigint' ? value.toString() : value), 2);
 }
 
+/**
+ * Paper mode has no real vault to fund from. The first time a ledger is ever used in paper mode
+ * (nothing deposited yet — a genuinely fresh ledger), seed it with a one-time simulated starting
+ * balance so a brand new paper session can actually place its first buy instead of forever
+ * reading a 0 QUAI balance (see src/sim#DEFAULT_PAPER_STARTING_QUAI_WEI +
+ * #derivePaperPortfolioFromLedger — that constant already existed but nothing wired it to an
+ * actual ledger deposit). A no-op once any deposit has ever been recorded (a real top-up or a
+ * prior seed), and a no-op in live mode entirely. Persisted to disk immediately (not left as an
+ * in-memory-only ctx.ledger mutation) so every mcp-server subprocess src/agents spawns for this
+ * run's analysts/decider reads the same seeded state back via its own loadLedger call — kept out
+ * of buildRunnerCtx (which tests call directly against a real, uninjected src/ledger) so the unit
+ * test suite never writes to state/ledger.json as a side effect.
+ * @param {object} ctx RunnerCtx (mutated: ctx.ledger is replaced with the seeded ledger)
+ * @param {{ recordDepositImpl?: Function, saveLedgerImpl?: Function, nowFn?: Function, amountWei?: bigint }} [opts]
+ * @returns {Promise<boolean>} true if a seed deposit was recorded
+ */
+export async function seedPaperLedgerIfFresh(ctx, opts = {}) {
+  const {
+    recordDepositImpl = recordDeposit,
+    saveLedgerImpl = saveLedger,
+    nowFn = Date.now,
+    amountWei = DEFAULT_PAPER_STARTING_QUAI_WEI,
+  } = opts;
+
+  if (!ctx.config?.paperMode) return false;
+  const ledger = ctx.ledger;
+  const alreadyFunded = !ledger || (Array.isArray(ledger.deposits) && ledger.deposits.length > 0) || ledger.totalDepositedWei !== '0';
+  if (alreadyFunded) return false;
+
+  ctx.ledger = recordDepositImpl(ledger, { amountWei, atMs: nowFn(), txHash: null });
+  await saveLedgerImpl(ctx.config.ledgerFile, ctx.ledger);
+  return true;
+}
+
 export async function main(argv = process.argv.slice(2)) {
   const args = parseArgs(argv);
   if (args.help) {
@@ -100,6 +135,14 @@ export async function main(argv = process.argv.slice(2)) {
   }
 
   const ctx = await buildRunnerCtx(args);
+
+  const seeded = await seedPaperLedgerIfFresh(ctx);
+  if (seeded) {
+    console.log(
+      `hartii-agent-trader: seeded a fresh paper ledger with ${DEFAULT_PAPER_STARTING_QUAI_WEI.toString()} wei starting paper capital (no prior deposits recorded)`,
+    );
+  }
+
   console.log(
     `hartii-agent-trader starting — mode: ${ctx.config.paperMode ? 'PAPER' : 'LIVE'}${ctx.config.dryRun ? ' (dry-run)' : ''}, profile: ${ctx.config.profile}, vault: ${ctx.config.vaultAddress || '(none configured)'}`,
   );

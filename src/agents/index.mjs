@@ -119,10 +119,16 @@ async function writeMcpConfig({ dir, writeFileImpl = writeFile, mcpServerCommand
   return configPath;
 }
 
-function buildClaudeArgv({ task, model, mcpConfigPath, allowedToolIds, systemPrompt }) {
+// The task prompt is sent over the spawned child's stdin (see runChildWithTimeout), never as a
+// positional argv element: the task embeds the full market snapshot plus (for the decider) every
+// analyst's proposals, easily exceeding Windows' ~32K total command-line length (CreateProcess's
+// lpCommandLine limit) once the market has any real number of tokens on it — this is exactly what
+// broke the first live smoke-test run ("spawn ENAMETOOLONG") once real market data replaced the
+// tiny fixtures used in tests. `-p` with no attached value is Claude Code's documented "read the
+// prompt from stdin" form.
+function buildClaudeArgv({ model, mcpConfigPath, allowedToolIds, systemPrompt }) {
   return [
     '-p',
-    task,
     '--model',
     model,
     '--strict-mcp-config',
@@ -144,12 +150,14 @@ function buildClaudeArgv({ task, model, mcpConfigPath, allowedToolIds, systemPro
 }
 
 /**
- * Spawns `command`/`args` with a hard wall-clock timeout. Never rejects — a spawn error or a
- * timeout comes back as a normal `{ code, stdout, stderr, timedOut }` result so callers decide
- * what a failed session means, exactly like the proven prototype's own child-process runner
- * (re-implemented here, not imported).
+ * Spawns `command`/`args` with a hard wall-clock timeout, writing `stdin` (the task prompt — see
+ * buildClaudeArgv's header comment on why it travels this way, not as an argv element) to the
+ * child's stdin and closing it. Never rejects — a spawn error or a timeout comes back as a normal
+ * `{ code, stdout, stderr, timedOut }` result so callers decide what a failed session means,
+ * exactly like the proven prototype's own child-process runner (re-implemented here, not
+ * imported).
  */
-function runChildWithTimeout(spawnImpl, command, args, { cwd, timeoutMs, env }) {
+function runChildWithTimeout(spawnImpl, command, args, { cwd, timeoutMs, env, stdin }) {
   return new Promise((resolve) => {
     let child;
     try {
@@ -157,6 +165,18 @@ function runChildWithTimeout(spawnImpl, command, args, { cwd, timeoutMs, env }) 
     } catch (err) {
       resolve({ code: null, stdout: '', stderr: `spawn error: ${err?.message || err}`, timedOut: false });
       return;
+    }
+
+    if (typeof stdin === 'string') {
+      try {
+        // A child that exits before we finish writing (crash, --help, etc.) can make this throw
+        // (EPIPE) or emit an 'error' on the stream — either way that's just this write failing,
+        // never this whole session; the child's own close/error handlers below still resolve.
+        child.stdin?.on?.('error', () => {});
+        child.stdin?.end?.(stdin, 'utf8');
+      } catch {
+        /* see above */
+      }
     }
 
     let stdout = '';
@@ -270,11 +290,12 @@ async function spawnSandboxedSession({ role, task, systemPrompt, allowedToolIds,
       mcpServerArgs,
       mcpServerEnv,
     });
-    const argv = buildClaudeArgv({ task, model, mcpConfigPath, allowedToolIds, systemPrompt });
+    const argv = buildClaudeArgv({ model, mcpConfigPath, allowedToolIds, systemPrompt });
     const { code, stdout, stderr, timedOut } = await runChildWithTimeout(spawnImpl, claudeCommand, argv, {
       cwd: dir,
       timeoutMs,
       env: childEnv,
+      stdin: task,
     });
 
     if (timedOut) {

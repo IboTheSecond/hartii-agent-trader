@@ -151,11 +151,37 @@ test('report: createReporter#reportTrade sends via Telegram and ntfy when both a
   assert.ok(sent.some((u) => u === 'https://ntfy.sh/t'));
 });
 
-test('report: createReporter sends nowhere when neither channel is configured, and never throws', async () => {
-  const reporter = createReporter({}, { sendImpl: neverCalledFetch, minIntervalMs: 0 });
+test('report: createReporter sends nowhere over the network when neither channel is configured, and never throws', async () => {
+  const reporter = createReporter({}, { sendImpl: neverCalledFetch, minIntervalMs: 0, writeImpl: () => {} });
   await reporter.reportTrade(fakeTrade(), fakeSnapshot());
   await reporter.reportHourly(fakeSnapshot());
   await reporter.reportBlocked('kill switch');
+});
+
+test('report: createReporter prints to stdout instead when neither channel is configured', async () => {
+  const printed = [];
+  const reporter = createReporter({}, { sendImpl: neverCalledFetch, minIntervalMs: 0, writeImpl: (text) => printed.push(text) });
+  await reporter.reportTrade(fakeTrade(), fakeSnapshot());
+  assert.equal(printed.length, 1);
+  assert.match(printed[0], /buy|sell/i);
+  await reporter.reportBlocked('kill switch');
+  assert.equal(printed.length, 2);
+  assert.match(printed[1], /kill switch/);
+});
+
+test('report: createReporter never prints to stdout when a real channel IS configured', async () => {
+  const printed = [];
+  const reporter = createReporter(
+    { telegram: { botToken: 'x', chatId: 'y' } },
+    { sendImpl: async () => ({ ok: true, status: 200, text: async () => '' }), minIntervalMs: 0, writeImpl: (text) => printed.push(text) },
+  );
+  await reporter.reportTrade(fakeTrade(), fakeSnapshot());
+  assert.equal(printed.length, 0);
+});
+
+test('report: createReporter#reportTrade\'s stdout fallback swallowing a writeImpl throw never rejects the caller', async () => {
+  const reporter = createReporter({}, { sendImpl: neverCalledFetch, minIntervalMs: 0, writeImpl: () => { throw new Error('stdout closed'); }, onError: () => {} });
+  await assert.doesNotReject(() => reporter.reportTrade(fakeTrade(), fakeSnapshot()));
 });
 
 test('report: createReporter swallows a send failure instead of rejecting the caller', async () => {

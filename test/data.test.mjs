@@ -188,6 +188,75 @@ test('data: getQuote rejects an invalid side without ever calling fetch', async 
   await assert.rejects(() => api.getQuote({ token: '0xabc', side: 'hold', amountWei: '1' }), TypeError);
 });
 
+// --- real wire-format normalization (confirmed live against hartiilabs.com 2026-09-29 — see
+// INTERFACE-REQUESTS.md's integration entry: list endpoints wrap their array in an envelope
+// object, several field names differ from this module's own pinned output types) -------------
+
+test('data: getTokens unwraps the real {network,view,items} envelope', async () => {
+  const fetchImpl = fakeFetch(() => jsonResponse({ network: 'mainnet', view: 'grid', items: [{ address: '0x1' }, { address: '0x2' }] }));
+  const api = createApiClient({ fetchImpl });
+  const rows = await api.getTokens();
+  assert.deepEqual(rows, [{ address: '0x1' }, { address: '0x2' }]);
+});
+
+test('data: getToken unwraps the real {token:{...}} envelope', async () => {
+  const fetchImpl = fakeFetch(() => jsonResponse({ token: { address: '0x001AAA', name: 'X', totalSupplyWei: '1000' } }));
+  const api = createApiClient({ fetchImpl });
+  const detail = await api.getToken('0x001AAA');
+  assert.equal(detail.name, 'X');
+  assert.equal(detail.totalSupplyWei, '1000');
+});
+
+test('data: getTrades unwraps {items} and maps trader/quaiAmount/tokenAmount/blockTime to wallet/amountQuaiWei/amountTokenWei/at', async () => {
+  const fetchImpl = fakeFetch(() => jsonResponse({
+    address: '0xabc',
+    items: [{ txHash: '0xdead', side: 'sell', trader: '0xw1', quaiAmount: '100', tokenAmount: '5', blockTime: '2026-01-01T00:00:00Z' }],
+  }));
+  const api = createApiClient({ fetchImpl });
+  const trades = await api.getTrades('0xabc');
+  assert.deepEqual(trades, [{ txHash: '0xdead', side: 'sell', wallet: '0xw1', amountQuaiWei: '100', amountTokenWei: '5', at: '2026-01-01T00:00:00Z' }]);
+});
+
+test('data: getRecentTrades maps rows with no tokenAmount to amountTokenWei "0" rather than throwing', async () => {
+  const fetchImpl = fakeFetch(() => jsonResponse({ items: [{ txHash: '0x1', side: 'buy', trader: '0xw1', quaiAmount: '50' }] }));
+  const api = createApiClient({ fetchImpl });
+  const trades = await api.getRecentTrades();
+  assert.equal(trades[0].amountTokenWei, '0');
+  assert.equal(trades[0].amountQuaiWei, '50');
+});
+
+test('data: getHolders unwraps {items} and maps holder/balance to wallet/amountWei, pct null when absent', async () => {
+  const fetchImpl = fakeFetch(() => jsonResponse({ address: '0xabc', items: [{ holder: '0xh1', balance: '999' }] }));
+  const api = createApiClient({ fetchImpl });
+  const holders = await api.getHolders('0xabc');
+  assert.deepEqual(holders, [{ wallet: '0xh1', amountWei: '999', pct: null }]);
+});
+
+test('data: getCandles unwraps {items} and maps bucketStart(seconds)/open/high/low/close/volumeQuai to t(ms)/o/h/l/c/volumeWei', async () => {
+  const fetchImpl = fakeFetch(() => jsonResponse({
+    address: '0xabc',
+    items: [{ tf: '5m', bucketStart: 1790714400, open: '1', high: '2', low: '1', close: '2', volumeQuai: '100', tradeCount: 1 }],
+  }));
+  const api = createApiClient({ fetchImpl });
+  const candles = await api.getCandles('0xabc');
+  assert.deepEqual(candles, [{ t: 1790714400000, o: '1', h: '2', l: '1', c: '2', volumeWei: '100' }]);
+});
+
+test('data: getQuote maps the real {amountInWei,expectedOutWei,feeWei,graduated,isV3} shape (no amountOut/priceImpact fields at all)', async () => {
+  const fetchImpl = fakeFetch(() => jsonResponse({
+    token: '0xabc', side: 'buy', amountInWei: '1000000000000000000', feeWei: '10000000000000000',
+    expectedOutWei: '34103283475410672229401', graduated: false, isV3: false, at: '2026-09-29T21:30:33.331Z',
+  }));
+  const api = createApiClient({ fetchImpl });
+  const quote = await api.getQuote({ token: '0xabc', side: 'buy', amountWei: '1000000000000000000' });
+  assert.equal(quote.amountOut, '34103283475410672229401');
+  assert.equal(quote.amountIn, '1000000000000000000');
+  assert.equal(quote.feeWei, '10000000000000000');
+  assert.equal(quote.graduated, false);
+  assert.equal(quote.isV3, false);
+  assert.equal(quote.priceImpact, null); // the live endpoint never provides this — never fabricated
+});
+
 // --- caching -----------------------------------------------------------------------------------
 
 test('data: getTokens caches within cacheTtlMs (single fetch for two calls)', async () => {

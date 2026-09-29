@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { parseArgs as parseKeygenArgs, printHelp as printKeygenHelp, runKeygenCli, writeKeyFile, grindCyprus1Key, isCyprus1Address } from '../bin/keygen.mjs';
-import { parseArgs as parseRunArgs, printHelp as printRunHelp, buildRunnerCtx } from '../bin/run.mjs';
+import { parseArgs as parseRunArgs, printHelp as printRunHelp, buildRunnerCtx, seedPaperLedgerIfFresh } from '../bin/run.mjs';
 import { parseArgs as parseStatusArgs, printHelp as printStatusHelp, runStatusCli } from '../bin/status.mjs';
 import { parseArgs as parseMcpArgs, printHelp as printMcpHelp, buildToolCtx, buildRoleTools } from '../bin/mcp-server.mjs';
 
@@ -128,6 +128,53 @@ test('run: --paper and --dry-run flags are mirrored onto the provided env object
   }
   assert.equal(env.HARTII_PAPER, '1');
   assert.equal(env.HARTII_DRY_RUN, '1');
+});
+
+test('run: seedPaperLedgerIfFresh records a one-time starting deposit for a genuinely fresh paper ledger', async () => {
+  let recordedWith = null;
+  let saved = null;
+  const ctx = { config: { paperMode: true, ledgerFile: 'state/ledger.json' }, ledger: { totalDepositedWei: '0', deposits: [], trades: [] } };
+  const seeded = await seedPaperLedgerIfFresh(ctx, {
+    recordDepositImpl: (ledger, args) => {
+      recordedWith = args;
+      return { ...ledger, totalDepositedWei: args.amountWei.toString(), deposits: [args] };
+    },
+    saveLedgerImpl: async (file, ledger) => { saved = { file, ledger }; },
+    nowFn: () => 12345,
+    amountWei: 999n,
+  });
+  assert.equal(seeded, true);
+  assert.equal(recordedWith.amountWei, 999n);
+  assert.equal(recordedWith.atMs, 12345);
+  assert.equal(recordedWith.txHash, null);
+  assert.equal(ctx.ledger.totalDepositedWei, '999');
+  assert.equal(saved.file, 'state/ledger.json');
+});
+
+test('run: seedPaperLedgerIfFresh is a no-op in live mode', async () => {
+  let called = false;
+  const ctx = { config: { paperMode: false, ledgerFile: 'state/ledger.json' }, ledger: { totalDepositedWei: '0', deposits: [], trades: [] } };
+  const seeded = await seedPaperLedgerIfFresh(ctx, {
+    recordDepositImpl: () => { called = true; },
+    saveLedgerImpl: async () => { called = true; },
+  });
+  assert.equal(seeded, false);
+  assert.equal(called, false);
+});
+
+test('run: seedPaperLedgerIfFresh is a no-op once any deposit has ever been recorded (real top-up or a prior seed)', async () => {
+  let called = false;
+  const ctx = {
+    config: { paperMode: true, ledgerFile: 'state/ledger.json' },
+    ledger: { totalDepositedWei: '5', deposits: [{ amountWei: '5', atMs: 1, txHash: null }], trades: [] },
+  };
+  const seeded = await seedPaperLedgerIfFresh(ctx, {
+    recordDepositImpl: () => { called = true; },
+    saveLedgerImpl: async () => { called = true; },
+  });
+  assert.equal(seeded, false);
+  assert.equal(called, false);
+  assert.equal(ctx.ledger.totalDepositedWei, '5'); // untouched
 });
 
 // --- bin/status.mjs -------------------------------------------------------------------------

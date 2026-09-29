@@ -268,4 +268,138 @@ remaining `not implemented` call sites at the time this was written. `bin/run.mj
 run for real fails at `src/config: loadConfig not implemented` — the only reason the harness
 can't be smoke-tested fully end-to-end right now. No action needed beyond finishing that module;
 noted here only so the status is stated plainly rather than implied.
-function, no other module depends on its internals.
+
+---
+
+## From: integration (2026-09-29)
+
+Implemented `src/config` (`loadConfig`/`getAgentKeyMaterial`) — the last blocking stub — and
+resolved every open item above:
+
+1. **`src/config` implemented.** `loadConfig` validates the full `env` table (mutually-exclusive
+   key/key-file, live-mode-only `HARTII_VAULT_ADDRESS` requirement, profile/numeric/telegram
+   validation, `HARTII_STATE_DIR`-derived paths), collects every missing/invalid field into one
+   `ConfigError` rather than throwing on the first, and never exposes the resolved key material as
+   an enumerable/JSON-serializable field (stored behind a module-private `Symbol`, non-enumerable,
+   on the frozen `Config`). 22 new tests in `test/config.test.mjs` (real temp-file key reads, no
+   network). `getAgentKeyMaterial` throws when `config.paperMode` is true, as pinned.
+2. **`ToolCtx.ledger`/`ledgerApi`/`paperEngine`/`chain`/`guard` folded into INTERFACES.md's
+   `src/tools` section** (were previously duck-typed-only) — `bin/mcp-server.mjs` already wired
+   all of them per its own header comment; this just makes the pinned contract match reality.
+3. **Extended tool set + `resolveAllowlist` folded into INTERFACES.md** (`hartii_token_detail`,
+   `hartii_trade_flow`, `hartii_holders`, the updated `TOOL_ALLOWLISTS`, `serveStdio`).
+4. **Resolved (code, not just documented): "paper mode never reads a real vault" now also covers
+   `src/tools`' own `hartii_status`/`hartii_buy`/`hartii_sell`**, not just `src/runner`'s prompt
+   context. When `config.paperMode` is true and `ctx.vault` is unset, these three tools now derive
+   portfolio-sizing state from `ctx.paperEngine.getState()` (holding marks from a best-effort live
+   sell quote per position) instead of requiring a live vault read, and use a documented
+   approximate gas-estimate fallback (`src/tools#DEFAULT_PAPER_GAS_ESTIMATE_WEI`, 4 QUAI, per
+   HARTII CHAIN FACTS) instead of a real `chain.estimateGasWei` preview, since there's no deployed
+   `vault.execute()` target to preview against with no vault configured. `ctx.paperEngine` is
+   still required either way (clean `ok:false`, never a throw). A configured vault (even unfunded,
+   in paper mode) still takes the real-read path unchanged — this is purely additive for the
+   no-vault-at-all case. README's "configure a real vault even for paper rehearsals" caveat is now
+   a recommendation for extra realism, not a requirement to get a paper session running at all. 8
+   new tests in `test/tools.test.mjs` cover both the new no-vault paper path and confirm every
+   pre-existing vault-configured test's behavior is byte-for-byte unchanged.
+5. **`bin/run.mjs` now seeds a one-time simulated starting paper balance** the first time a fresh
+   ledger is used in paper mode (`seedPaperLedgerIfFresh`, called from `main()` only — never from
+   the unit-tested `buildRunnerCtx`, so `npm test` never writes to `state/ledger.json`) —
+   `src/sim#DEFAULT_PAPER_STARTING_QUAI_WEI` existed already but nothing ever wired it to an actual
+   `src/ledger#recordDeposit`, so a brand-new paper session could never afford its first buy (paper
+   cash is `totalDepositedWei − buys + sells − gas`; a fresh ledger has `totalDepositedWei: '0'`).
+   Persisted to disk before any cycle runs, so every `bin/mcp-server.mjs` subprocess reads the same
+   seeded ledger. Live mode and any ledger with a prior deposit (real or seeded) are untouched.
+6. **Item 5 (V3/launch calldata builder)** left open as originally flagged — low priority, launches
+   off by default, not required for paper-mode trading.
+7. **Real smoke test (`node bin/run.mjs --paper --once` against the live API + RPC) surfaced that
+   `src/data`'s "confirmed live 2026-09-29" claim for `/api/tokens`/`/api/token/:addr`/
+   `/api/token/:addr/trades`/`/api/token/:addr/holders`/`/api/token/:addr/candles`/
+   `/api/agent/quote` was wrong** — re-verified live just now (2026-09-29, this session) against
+   the real responses:
+   - **List endpoints wrap their array**: `/api/tokens` → `{network,view,items:[...]}`,
+     `/api/token/:addr/{trades,holders,candles}` → `{address,items:[...]}`, not a bare array.
+     `getTokens()` returned the whole envelope object, so `(tokens || []).filter is not a
+     function` crashed `src/runner#runCycle` on its very first real call — this was the first
+     thing the smoke test hit, and would have blocked literally every cycle.
+   - **`/api/token/:addr` wraps its payload**: `{ token: {...} }`, not the token object itself.
+   - **Trade rows use `trader`/`quaiAmount`/`tokenAmount`/`blockTime`**, not `wallet`/
+     `amountQuaiWei`/`amountTokenWei`/`at`. `/api/trades/recent` rows carry no `tokenAmount` at
+     all (a lighter-weight shape than the per-token trades endpoint).
+   - **Holder rows use `holder`/`balance`**, not `wallet`/`amountWei`, and carry **no percentage
+     field at all** (`pct` doesn't exist in the response — the previous pinned type's `pct:
+     number` was never actually confirmable against a real response).
+   - **Candle rows use `bucketStart` (whole seconds)/`open`/`high`/`low`/`close`/`volumeQuai`**,
+     not `t` (ms)/`o`/`h`/`l`/`c`/`volumeWei`.
+   - **`/api/agent/quote` returns `{token,side,amountInWei,feeWei,expectedOutWei,graduated,isV3,at}`
+     — there is no `amountOut`, `priceImpact`, or `minOut` field at all.** This is the most
+     severe of these: `src/sim#createPaperEngine.buy/sell` reads `quote.amountOut` via a
+     `toBigInt` call that *throws* on `undefined`, so **every single paper buy/sell would have
+     failed** with "bad quote: ..." before this fix — the harness's core promise ("guarded paper
+     execution") was non-functional end to end. Separately, `src/tools#executeGuardedTrade` read
+     `quote.priceImpact ?? 0` — since the field never exists, this silently defaulted the
+     mandatory price-impact guard to "0% impact, always passes" on every real trade, silently
+     disabling a HARD SAFETY RULE (price impact ≤ configured ceiling) rather than merely being
+     inaccurate.
+
+   **Fixed in `src/data`** (normalizes at the boundary, once, so nothing downstream needs to know
+   the raw wire format — see INTERFACES.md's rewritten "Raw wire format" section):
+   `getTokens`/`getCandles`/`getTrades`/`getHolders`/`getRecentTrades` now unwrap `items` (still
+   accepting a bare array defensively); `getToken` unwraps `.token`; every row is mapped to this
+   module's own pinned field names; `getQuote` maps `expectedOutWei→amountOut`,
+   `amountInWei→amountIn`, and passes `feeWei`/`graduated`/`isV3` through additively, with
+   `priceImpact: null` (never fabricated) since the endpoint has no such field.
+
+   **Fixed in `src/tools`**: `computePriceImpactPct` (new) derives price impact from the quote's
+   own implied average execution price vs. the token's current spot price
+   (`ctx.api.getToken(token).lastPriceWei`) whenever `quote.priceImpact` isn't already a number —
+   and returns `NaN` (never `0`) on any failure to compute it, so
+   `src/guard#enforcePriceImpact`'s existing "reject a non-finite priceImpactPct" rule makes an
+   unknown price impact **fail closed**, exactly like an excessive one, rather than ever silently
+   passing as "negligible." `holderPct` (new) computes a holder's percentage from
+   `amountWei/totalSupplyWei` whenever the row itself doesn't already carry a `pct` (the live API
+   never does) — `hartii_holders` now also fetches the token's `totalSupplyWei` (best-effort, one
+   extra cached call) so its own top10Pct is a real number instead of always 0.
+
+   16 new tests across `test/data.test.mjs` (real envelope/field-name fixtures for every
+   endpoint) and `test/tools.test.mjs` (priceImpact fallback + fail-closed-on-failure +
+   "trusts an explicit quote.priceImpact and skips the extra call" paths). Every pre-existing
+   test's fixtures happened to already match the post-normalization shape for the specific
+   fields each one asserted on, so none needed changing — confirmed by running them unmodified
+   before adding the new ones.
+
+   **Not re-verified this pass** (flagged, not fixed): `/api/agent/vault/:addr`'s `VaultState`
+   shape and `/api/agent/manifest`'s exact `caps`/`targets`/`forbiddenSelectors` fields — this
+   smoke test ran with no `HARTII_VAULT_ADDRESS` configured (paper mode, no vault — see item 4
+   above), so neither was exercised against the real endpoint. Re-verify against a real vault
+   address before trusting `VaultState` in live mode.
+
+8. **Real smoke test also surfaced `spawn ENAMETOOLONG` on the decider** (Windows' ~32K total
+   command-line length, easily exceeded once the task prompt embeds a real market snapshot plus
+   all three analysts' proposals) — `src/agents` was passing the task prompt as a positional argv
+   element to `claude -p <task>`. **Fixed**: the task now travels over the spawned child's stdin
+   (`-p` with no attached value is Claude Code's documented "read the prompt from stdin" form);
+   `buildClaudeArgv` no longer takes/embeds `task` at all, `runChildWithTimeout` writes+closes
+   `opts.stdin`. `systemPrompt` (`--append-system-prompt`) stays on argv — it's bounded by
+   `briefs/*.md`'s own size (a few KB), nowhere near the limit. New regression test asserts the
+   task text never appears in argv and does appear on the captured child's stdin.
+9. **Real smoke test also surfaced that every relative state path
+   (`ledgerFile`/`statusFile`/`memoryFile`/`killSwitchFile`, default `state/...`) was resolved
+   against `process.cwd()`** — fine for `bin/run.mjs`'s own process, but `src/agents` spawns each
+   sandboxed analyst/decider session with its cwd set to a fresh, empty, per-invocation temp
+   sandbox directory (see `src/agents#createSandbox`), and `bin/mcp-server.mjs` (the MCP server
+   subprocess running inside that sandbox) calls `loadConfig(env)` again from there. A relative
+   `ledgerFile` therefore resolved to two different, unrelated locations depending which process
+   asked — confirmed live: `bin/run.mjs` correctly seeded `state/ledger.json` with 1000 QUAI paper
+   capital (visible in `status.json`), but the decider's own `hartii_status` tool call, running
+   inside the sandbox, read an empty ledger at its own sandbox-relative `state/ledger.json` (which
+   doesn't exist) and reported "Vault QUAI balance is 0", refusing to trade despite real, fundable
+   candidates. **Fixed in `src/config`**: every state path is now resolved to an **absolute** path
+   anchored at this repo's own root (derived from `src/config/index.mjs`'s own file location via
+   `import.meta.url`, never `process.cwd()`) — so `loadConfig(env)` resolves to the exact same
+   ledger/status/memory/kill-switch files no matter which process or working directory calls it.
+   An already-absolute `HARTII_STATE_DIR`/`HARTII_KILL_SWITCH_FILE` is used as-is (e.g. for a
+   deliberately test-isolated location). New tests cover both the repo-root-anchored default and
+   the already-absolute case.
+10. Full suite green (`npm test`). `node bin/run.mjs --paper --once` run for real against the live
+    public API + RPC (no key, no transaction) — see git log / session notes for the outcome.

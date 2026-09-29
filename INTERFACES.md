@@ -260,8 +260,13 @@ export function sanitizeTokenText(tokenRow: object) -> object
 export class ApiError extends Error { status: number; body: unknown }
 ```
 
-### JSON shapes (fields confirmed live against `hartiilabs.com` 2026-09-29; treat anything not
-listed here as present-but-unstable and do not depend on it without re-checking)
+### JSON shapes — this module's OWN output types (fields confirmed live against `hartiilabs.com`
+2026-09-29; treat anything not listed here as present-but-unstable and do not depend on it
+without re-checking). **These are what every method above returns after normalization — not the
+raw wire format**, which differs in two ways every method reconciles internally (see "Raw wire
+format" below): list endpoints wrap their array in an envelope object instead of returning it
+bare, and several per-row field names differ from the names used here. Every consumer outside
+this module works only with the shapes below.
 
 ```ts
 type TokenListItem = {
@@ -288,13 +293,32 @@ type VaultState = {
   recentActivity: Array<object>;
 }
 
-type Quote = { amountIn: string; amountOut: string; priceImpact: number; minOut: string };
+// The live /api/agent/quote endpoint returns NO amountOut/priceImpact/minOut fields at all (see
+// below) — amountOut is mapped from its expectedOutWei; priceImpact is always null here (the
+// endpoint has no such concept) for src/tools#computePriceImpactPct to derive from a spot price,
+// or fail closed, rather than this module ever fabricating a 0. feeWei/graduated/isV3 are
+// additive passthroughs from the real response, not in the original pinned shape.
+type Quote = { amountIn: string; amountOut: string | null; priceImpact: number | null; minOut: string | null; feeWei: string | null; graduated: boolean | null; isV3: boolean | null };
 
-type Candle = { t: number, o: string, h: string, l: string, c: string, volumeWei: string };
+type Candle = { t: number, o: string, h: string, l: string, c: string, volumeWei: string }; // t in MILLISECONDS
 type Trade = { txHash: string, side: 'buy' | 'sell', wallet: string, amountQuaiWei: string, amountTokenWei: string, at: string };
-type Holder = { wallet: string, amountWei: string, pct: number };
+type Holder = { wallet: string, amountWei: string, pct: number | null }; // pct is null unless the raw row already had one — see src/tools#holderPct for how it gets computed from a known totalSupplyWei instead
 type LiquidityInfo = { curve: { quai: string, token: string }, pools: Array<object>, totalQuai: string, liquidityQuaiValue: string };
 ```
+
+### Raw wire format (what the real HTTP responses actually look like — confirmed live 2026-09-29;
+this module's methods normalize every one of these to the shapes above, once, so nothing else
+in the codebase needs to know this section exists)
+
+- `GET /api/tokens` → `{ network, view, items: TokenListItem[] }` (`getTokens` returns `items`, or `nextCursor` if present — not consumed by any current caller — for pagination).
+- `GET /api/token/:addr` → `{ token: {...} }` (`getToken` returns `.token`).
+- `GET /api/token/:addr/liquidity` → already flat, matches `LiquidityInfo` — no unwrapping needed.
+- `GET /api/token/:addr/candles` → `{ address, items: [{ tf, bucketStart (whole SECONDS), open, high, low, close, volumeQuai, tradeCount }], at, bounded }` (`getCandles` maps `bucketStart*1000→t`, `open/high/low/close→o/h/l/c`, `volumeQuai→volumeWei`).
+- `GET /api/token/:addr/trades` → `{ address, items: [{ txHash, side, trader, quaiAmount, tokenAmount, blockTime, blockNumber, logIndex, ... }] }` (`getTrades` maps `trader→wallet`, `quaiAmount→amountQuaiWei`, `tokenAmount→amountTokenWei`, `blockTime→at`).
+- `GET /api/trades/recent` → same envelope as above, but rows carry no `tokenAmount` at all — `getRecentTrades` defaults `amountTokenWei` to `'0'` rather than fabricating a value.
+- `GET /api/token/:addr/holders` → `{ address, items: [{ holder, balance, updatedAt }] }`, **no percentage field at all** (`getHolders` maps `holder→wallet`, `balance→amountWei`, `pct: null`).
+- `GET /api/agent/quote?token&side&amountWei` → `{ token, side, amountInWei, feeWei, expectedOutWei, graduated, isV3, at }` — no `amountOut`/`priceImpact`/`minOut` fields (see `Quote` above for the mapping).
+- `GET /api/agent/manifest`, `GET /api/agent/vault/:addr` — not yet independently re-verified against the live shape this pass; treat their pinned types above as the original builder's claim, not freshly confirmed.
 
 `GET /api/tokens`, `/api/token/:addr`, `/api/token/:addr/liquidity`, `/api/token/:addr/candles`,
 `/api/token/:addr/trades`, `/api/token/:addr/holders`, `/api/trades/recent`,
@@ -411,7 +435,8 @@ session is even allowed to see (mirrors the proven pattern: a narrow `--allowedT
 part of the sandbox, not a suggestion).
 
 ```js
-/** Read-only tools: market snapshot, vault status, quote. No key use, no writes. */
+/** Read-only tools: market snapshot, vault status, quote, token deep-dive, trade flow, holders.
+ * No key use, no writes. */
 export function buildReadOnlyTools(ctx: ToolCtx) -> ToolDef[]
 
 /** Guarded trade tools: hartii_buy / hartii_sell, run every proposed size through src/guard
@@ -423,28 +448,77 @@ export function buildTradeTools(ctx: ToolCtx) -> ToolDef[]
 export function createMcpServer(tools: ToolDef[], { name: string, version?: string }) -> McpServer
 // stdio transport, @modelcontextprotocol/sdk McpServer, one tool per ToolDef.
 
+/** Connects an already-built McpServer to a stdio transport (the natural companion to
+ * createMcpServer for bin/mcp-server.mjs — the actual MCP server subprocess src/agents spawns
+ * per sandboxed session). */
+export async function serveStdio(server: McpServer) -> StdioServerTransport
+
 /** Tool-name allowlists per agent role — the literal --allowedTools list passed to each
- * sandboxed claude -p invocation. */
+ * sandboxed claude -p invocation. Extended beyond the original 4-tool minimum once
+ * hartii_token_detail/hartii_trade_flow/hartii_holders shipped — see INTERFACE-REQUESTS.md item
+ * "Extended the read-only tool set beyond the 3 pinned schemas". */
 export const TOOL_ALLOWLISTS: {
-  momentumScout: ['hartii_market'],
-  riskAnalyst: ['hartii_market', 'hartii_token_detail'],
+  momentumScout: ['hartii_market', 'hartii_trade_flow'],
+  riskAnalyst: ['hartii_market', 'hartii_token_detail', 'hartii_holders', 'hartii_trade_flow'],
   portfolioManager: ['hartii_market', 'hartii_status'],
   decider: ['hartii_market', 'hartii_status', 'hartii_quote', 'hartii_buy', 'hartii_sell'],
   // '+hartii_launch_token' appended to decider's list only when launches are enabled.
 }
 
-type ToolCtx = { api: ApiClient, provider, wallet: Wallet | null, vault: string | null, config: Config, guardCtx: object };
+/** Resolves the actual --allowedTools list for a role given the active config — TOOL_ALLOWLISTS[role]
+ * plus 'hartii_launch_token' for the decider only when config.launchesEnabled. bin/mcp-server.mjs
+ * filters its built tool array to this list (belt-and-braces) rather than reading
+ * TOOL_ALLOWLISTS[role] directly. */
+export function resolveAllowlist(role: string, config: { launchesEnabled?: boolean }) -> string[]
+
+type ToolCtx = {
+  api: ApiClient, provider, wallet: Wallet | null, vault: string | null, config: Config,
+  // Optional — every field below degrades gracefully (documented per-field) rather than
+  // throwing when omitted, so a caller can wire only what it has:
+  ledger?: Ledger,          // src/ledger schema — powers hartii_status's realized/unrealized PnL.
+  ledgerApi?: typeof import('../ledger/index.mjs'),  // src/ledger's own exports, passed in rather
+                                                       // than imported, so src/tools never hard-
+                                                       // depends on src/ledger's build status.
+  paperEngine?: PaperEngine | null,  // src/sim#createPaperEngine instance. Required (hard error,
+                                       // never a throw) for hartii_buy/hartii_sell/hartii_status
+                                       // whenever config.paperMode is true AND no vault is wired
+                                       // (see "paper mode with no vault" below) — always required
+                                       // for hartii_buy/hartii_sell execution itself in paper mode
+                                       // regardless of whether a vault is configured.
+  chain?: typeof import('../chain/index.mjs'),  // test-only DI seam; real module when omitted.
+  guard?: typeof import('../guard/index.mjs'),  // test-only DI seam; real module when omitted.
+  launchState?: { count: number, lastAtMs: number | null },
+  approvedImageUrls?: string[],
+};
 type ToolDef = { name: string, description: string, inputSchema: object, handler: (args, ctx) => Promise<object> };
 ```
+
+**Paper mode with no vault configured at all.** `config.vaultAddress`/`ctx.vault` is genuinely
+optional in paper mode (nothing paper does ever touches the real vault — matches `src/runner`'s
+own stance). When `ctx.vault` is unset and `config.paperMode` is true, `hartii_status` /
+`hartii_buy` / `hartii_sell` derive portfolio-sizing context from `ctx.paperEngine.getState()`
+instead of a live vault read (holding mark values come from a best-effort live sell quote per
+position — a failed quote degrades that one holding to a 0 mark rather than failing the call),
+and the 5x-gas guard floor uses a documented approximate constant
+(`src/tools#DEFAULT_PAPER_GAS_ESTIMATE_WEI`, 4 QUAI, matching HARTII CHAIN FACTS' "~3-4 QUAI per
+vault trade") instead of a real `chain.estimateGasWei` preview, since there is no deployed
+`vault.execute()` target to preview a call against. `ctx.paperEngine` is still required in this
+case (a hard, clean `{ ok: false, error: '...ctx.paperEngine...' }`, never a throw) — only the
+*live vault read* is skipped, not the paper engine itself. When a vault address IS configured
+(even an unfunded one, in paper mode — still the recommended default; see README), the real vault
+read and real gas estimate are used as before, for extra realism.
 
 ### MCP tool schemas (JSON in/out; every amount is a decimal-string wei)
 
 - **`hartii_market`** — read-only, no input. Output: `{ ok: true, candidates: MarketCandidate[], holdings: HoldingView[], at: string }` where `MarketCandidate` is a sanitized (`sanitizeTokenText`), filtered (`tradeable: true` only — hidden/flagged/untradeable already excluded) view of `TokenListItem`, and `HoldingView` mirrors `VaultState.holdings` with a live mark value.
-- **`hartii_status`** — no input. Output: `VaultState` plus `{ realizedPnlWei, unrealizedPnlWei, growthPct }` from `src/ledger`.
+- **`hartii_status`** — no input. Output: `VaultState` plus `{ realizedPnlWei, unrealizedPnlWei, growthPct }` from `src/ledger` (zeroed when `ctx.ledger`/`ctx.ledgerApi` aren't wired). In paper mode with no vault configured, `VaultState` is synthesized from `ctx.paperEngine` — see above.
 - **`hartii_quote`** — input `{ token: string, side: 'buy'|'sell', amountWei: string }`. Output: `Quote`.
+- **`hartii_token_detail`** — input `{ token: string }`. Output: sanitized token detail + combined liquidity + holder concentration (top10 + creator share) + curve progress toward graduation.
+- **`hartii_trade_flow`** — input `{ token: string, limit?: number }`. Output: recent trades + buy/sell QUAI-volume imbalance + unique-trader count.
+- **`hartii_holders`** — input `{ token: string, limit?: number }`. Output: holder list + top-10 concentration.
 - **`hartii_buy`** — input `{ token: string, amountInWei: string, minTokensOutWei: string }` (slippage floor mandatory — `src/guard#enforceSlippageFloor` rejects an unset one). Output: `{ ok: boolean, clipped: boolean, amountInWei: string, txHash: string | null, error?: string, warnings: string[] }`.
 - **`hartii_sell`** — input `{ token: string, tokensInWei: string, minQuaiOutWei: string }`. Output: mirrors `hartii_buy`.
-- **`hartii_launch_token`** *(only present when launches are enabled)* — input `{ name, symbol, imageUrl }`. Output mirrors buy/sell; gated by `src/guard#enforceLaunchGate`.
+- **`hartii_launch_token`** *(only present when launches are enabled)* — input `{ name, symbol, imageUrl }`. Output mirrors buy/sell; gated by `src/guard#enforceLaunchGate`. No on-chain launch-calldata builder exists in `src/chain` yet, so this always returns `{ ok: false, error: '...' }` even when the gate passes — see INTERFACE-REQUESTS.md item 5 (low priority; launches are off by default).
 
 ---
 
@@ -553,7 +627,10 @@ type Status = { lastCycleAtMs: number, cyclesRun: number, paperMode: boolean, po
 ## `src/report`
 
 Telegram (+ optional ntfy) formatting/sending/throttling. Plain text only, safe for
-underscores in token symbols (no unescaped Markdown).
+underscores in token symbols (no unescaped Markdown). When neither `config.telegram` nor
+`config.ntfyUrl` is configured, every report is printed to stdout instead (`opts.writeImpl`,
+default `console.log`) rather than silently discarded — this is how a paper rehearsal with no
+`TELEGRAM_*`/`NTFY_URL` set still surfaces every trade/hourly/blocked report.
 
 ```js
 export function formatTradeMessage(trade: TradeRecord, snapshot: PortfolioSnapshot) -> string
@@ -562,8 +639,9 @@ export function formatTradeMessage(trade: TradeRecord, snapshot: PortfolioSnapsh
 // last ~5 trades, realized/unrealized PnL, gas spent, growth % vs deposits.
 export function formatHourlySummary(snapshot: PortfolioSnapshot) -> string
 
-export function createReporter(config: Config, { sendImpl? } = {}) -> Reporter
-// internally rate-limits to ~1 msg/s and batches within a cycle.
+export function createReporter(config: Config, { sendImpl?, writeImpl? } = {}) -> Reporter
+// internally rate-limits to ~1 msg/s and batches within a cycle. writeImpl(text: string) is the
+// stdout fallback used only when neither Telegram nor ntfy is configured (see above).
 
 class Reporter {
   async reportTrade(trade: TradeRecord, snapshot: PortfolioSnapshot) -> Promise<void>

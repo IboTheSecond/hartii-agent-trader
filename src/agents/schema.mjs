@@ -51,6 +51,19 @@ const DeciderActionSchema = z.object({
     .nullable(),
   ok: z.boolean(),
   warnings: z.array(z.string()).default([]),
+  // Additive, optional — not in INTERFACES.md's original minimal DeciderResult.actions shape.
+  // src/runner#buildTradeRecord already knows how to consume each of these when present (falling
+  // back sanely when absent); without amountOutWei in particular, a recorded trade's tokens/price
+  // always came back as 0 regardless of what actually filled, since a sandboxed decider session's
+  // own tool calls are otherwise invisible to src/runner — see INTERFACE-REQUESTS.md's
+  // integration entry (confirmed live) and this schema's task prompt (buildDeciderPrompt), which
+  // now explicitly asks the model to copy a successful hartii_buy/hartii_sell tool response's
+  // amountOutWei through into this field.
+  amountOutWei: z.string().regex(WEI_RE, 'amountOutWei must be a decimal-string wei amount').nullish(),
+  priceQuaiPerTokenWei: z.string().regex(WEI_RE, 'priceQuaiPerTokenWei must be a decimal-string wei amount').nullish(),
+  gasWei: z.string().regex(WEI_RE, 'gasWei must be a decimal-string wei amount').nullish(),
+  symbol: z.string().max(32).nullish(),
+  reason: z.string().max(500).nullish(),
 });
 
 const DeciderResultSchema = z.object({

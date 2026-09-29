@@ -194,10 +194,20 @@ function createThrottle({ minIntervalMs = 1100, sleepFn = (ms) => new Promise((r
 
 /**
  * @param {object} config Config (reads config.telegram / config.ntfyUrl)
- * @param {{ sendImpl?: Function, minIntervalMs?: number, sleepFn?: Function, now?: () => number, onError?: (err: Error, context: string) => void }} [opts]
+ * @param {{ sendImpl?: Function, minIntervalMs?: number, sleepFn?: Function, now?: () => number, onError?: (err: Error, context: string) => void, writeImpl?: (text: string) => void }} [opts]
  */
 export function createReporter(config, opts = {}) {
-  const { sendImpl = fetch, minIntervalMs = 1100, sleepFn, now, onError = (err, ctx) => console.error(`[report] ${ctx}: ${err?.message || err}`) } = opts;
+  const {
+    sendImpl = fetch,
+    minIntervalMs = 1100,
+    sleepFn,
+    now,
+    onError = (err, ctx) => console.error(`[report] ${ctx}: ${err?.message || err}`),
+    // No Telegram/ntfy configured at all — print the report to stdout instead of silently
+    // discarding it, so a paper rehearsal (or any run with TELEGRAM_*/NTFY_URL unset) still
+    // surfaces every trade/hourly/blocked report somewhere a human can see it.
+    writeImpl = (text) => console.log(text),
+  } = opts;
   const throttle = createThrottle({ minIntervalMs, ...(sleepFn ? { sleepFn } : {}), ...(now ? { now } : {}) });
 
   async function deliver(text, { ntfyText = null, context } = {}) {
@@ -209,6 +219,14 @@ export function createReporter(config, opts = {}) {
     }
     if (config?.ntfyUrl) {
       jobs.push(sendNtfy(config.ntfyUrl, ntfyText ?? text, sendImpl).catch((err) => onError(err, `${context}/ntfy`)));
+    }
+    if (jobs.length === 0) {
+      try {
+        writeImpl(text);
+      } catch (err) {
+        onError(err, `${context}/stdout`);
+      }
+      return;
     }
     await Promise.all(jobs);
   }

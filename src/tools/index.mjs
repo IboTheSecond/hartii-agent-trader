@@ -60,6 +60,46 @@ function resolveMaxFractionBps(ctx) {
   return ctx.config?.maxFractionOfPortfolioBps ?? DEFAULTS.maxFractionOfPortfolioBps;
 }
 
+/**
+ * Percentage price impact of one quoted trade vs. the token's current spot price — the live
+ * `/api/agent/quote` endpoint reports no `priceImpact` field at all (see src/data#getQuote), so
+ * this computes it from the quote's own implied average execution price against
+ * `detail.lastPriceWei` (fetched via `ctx.api.getToken`, cached, so this is a cheap call in
+ * practice). Returns `NaN` — never a fabricated `0` — on any failure (missing/invalid quote
+ * amount, a getToken failure, an unknown/zero spot price): `src/guard#enforcePriceImpact`
+ * already rejects a non-finite `priceImpactPct` outright, so an unknown price impact fails
+ * closed exactly like an excessive one, never silently passes as "0% impact".
+ * @returns {Promise<number>}
+ */
+async function computePriceImpactPct(ctx, { side, token, primaryWei, quote }) {
+  if (typeof quote?.priceImpact === 'number' && Number.isFinite(quote.priceImpact)) {
+    return quote.priceImpact; // the API provided one directly — trust it over a derived estimate.
+  }
+  const amountOutWei = safeBigInt(quote?.amountOut);
+  if (amountOutWei === null || amountOutWei <= 0n || primaryWei <= 0n) return NaN;
+
+  let spotPriceWei;
+  try {
+    const detail = await ctx.api.getToken(token);
+    spotPriceWei = safeBigInt(detail?.lastPriceWei);
+  } catch {
+    return NaN;
+  }
+  if (spotPriceWei === null || spotPriceWei <= 0n) return NaN;
+
+  const SCALE = 10n ** 18n;
+  // side === 'buy': primaryWei is QUAI in, amountOutWei is tokens out — avg QUAI paid per 1e18
+  // tokens. side === 'sell': primaryWei is tokens in, amountOutWei is QUAI out — avg QUAI
+  // received per 1e18 tokens. Both compare that average against the current spot price, as a
+  // positive percentage only when the fill is worse than spot (never negative — a fill at or
+  // better than spot is 0% impact, not a "negative impact").
+  const avgPriceWei = side === 'buy' ? (primaryWei * SCALE) / amountOutWei : (amountOutWei * SCALE) / primaryWei;
+  const worseThanSpot = side === 'buy' ? avgPriceWei > spotPriceWei : avgPriceWei < spotPriceWei;
+  if (!worseThanSpot) return 0;
+  const diff = side === 'buy' ? avgPriceWei - spotPriceWei : spotPriceWei - avgPriceWei;
+  return Number((diff * 10000n) / spotPriceWei) / 100;
+}
+
 async function resolveAgentAddress(ctx, chain) {
   if (ctx.wallet?.address) return ctx.wallet.address;
   const caps = await chain.getVaultCaps(ctx.provider, ctx.vault);
@@ -79,17 +119,31 @@ function isTradeable(token) {
   return true;
 }
 
-/** Top-10 + creator holder concentration, defensive against missing fields. */
+/** `holder.pct` as a plain number, computed against `totalSupplyWei` when the row itself doesn't
+ * already carry one — the live API's holder rows report no percentage at all (see
+ * src/data#normalizeHolder), so this is how one gets computed at all. Returns 0 (never NaN) when
+ * neither is available. */
+function holderPct(holder, totalSupplyWei) {
+  if (typeof holder?.pct === 'number') return holder.pct;
+  const amount = safeBigInt(holder?.amountWei);
+  if (amount === null || amount <= 0n || totalSupplyWei === null || totalSupplyWei <= 0n) return 0;
+  return Number((amount * 1000000n) / totalSupplyWei) / 10000; // 4 decimal places, no float division of bigints
+}
+
+/** Top-10 + creator holder concentration, defensive against missing fields. `detail` (when
+ * given) supplies `totalSupplyWei` to compute each holder's pct on the fly whenever the row
+ * itself doesn't already carry one (see holderPct above). */
 function summarizeHolders(holders, detail) {
   const list = Array.isArray(holders) ? holders : [];
-  const top10PctSum = list.slice(0, 10).reduce((sum, h) => sum + (Number(h?.pct) || 0), 0);
+  const totalSupplyWei = safeBigInt(detail?.totalSupplyWei);
+  const top10PctSum = list.slice(0, 10).reduce((sum, h) => sum + holderPct(h, totalSupplyWei), 0);
   const creator = typeof detail?.creator === 'string' ? detail.creator.toLowerCase() : null;
   const creatorHolder = creator
     ? list.find((h) => typeof h?.wallet === 'string' && h.wallet.toLowerCase() === creator)
     : null;
   return {
     top10Pct: Number(top10PctSum.toFixed(2)),
-    creatorPct: creatorHolder ? Number(creatorHolder.pct) || 0 : null,
+    creatorPct: creatorHolder ? holderPct(creatorHolder, totalSupplyWei) : null,
     holderCount: list.length,
   };
 }
@@ -133,6 +187,40 @@ function summarizeTradeFlow(trades) {
     uniqueTraders: uniqueTraders.size,
     tradeCount: list.length,
   };
+}
+
+// Used only when paper mode has no real vault configured at all (no HARTII_VAULT_ADDRESS) — a
+// documented approximate gas-cost fallback for the 5x-gas guard floor, matching the task brief's
+// own HARTII CHAIN FACTS ("Gas ~26k gwei => ~3-4 QUAI per vault trade"), since there is no
+// deployed vault.execute() target to preview a real gas estimate against. Whenever a vault IS
+// configured (even an unfunded one, even in paper mode — see README's recommendation), the real
+// chain.estimateGasWei path below is used instead of this constant.
+export const DEFAULT_PAPER_GAS_ESTIMATE_WEI = 4n * 10n ** 18n;
+
+/**
+ * Paper-mode, vault-shaped portfolio state built from the PaperEngine's own cash + positions —
+ * used in place of a live ctx.api.getVault(ctx.vault) read whenever paper mode has no real vault
+ * configured (nothing paper does ever needs the real vault; see src/runner's own paper-mode
+ * stance and INTERFACE-REQUESTS.md item 3). Each holding's mark value comes from a best-effort
+ * live sell quote — a quote failure degrades that one holding to a 0 mark rather than failing the
+ * whole call, since an unknown mark must never block guard sizing or status reporting.
+ * @param {object} ctx ToolCtx (ctx.paperEngine must be wired)
+ * @returns {Promise<{ quaiBalanceWei: string, holdings: Array<{ token: string, amountWei: string, markValueQuaiWei: string }>, paused: boolean }>}
+ */
+async function buildPaperVaultState(ctx) {
+  const state = ctx.paperEngine.getState();
+  const holdings = [];
+  for (const [token, amountWei] of Object.entries(state.positions)) {
+    let markValueQuaiWei = '0';
+    try {
+      const quote = await ctx.api.getQuote({ token, side: 'sell', amountWei: amountWei.toString() });
+      markValueQuaiWei = (safeBigInt(quote?.amountOut) ?? 0n).toString();
+    } catch {
+      /* best-effort mark only — see doc comment above */
+    }
+    holdings.push({ token, amountWei: amountWei.toString(), markValueQuaiWei });
+  }
+  return { quaiBalanceWei: state.quaiWei.toString(), holdings, paused: false };
 }
 
 async function computeLedgerPnl(ctx, vaultState) {
@@ -202,6 +290,15 @@ export function buildReadOnlyTools(ctx) {
     inputSchema: {},
     handler: async (_args, ctxArg) => {
       const c = ctxArg || ctx;
+      // Paper mode never needs the real vault — a configured one is read for extra realism when
+      // present, but a pure paper session (no HARTII_VAULT_ADDRESS at all) still works, derived
+      // from the PaperEngine itself. See buildPaperVaultState's doc comment.
+      if (c.config?.paperMode && !c.vault) {
+        if (!c.paperEngine) return { ok: false, error: 'paper mode requires ctx.paperEngine to be wired' };
+        const vault = await buildPaperVaultState(c);
+        const pnl = await computeLedgerPnl(c, vault);
+        return { ok: true, ...vault, ...pnl };
+      }
       if (!c.vault) return { ok: false, error: 'ctx.vault is not configured' };
       const vault = await c.api.getVault(c.vault);
       const pnl = await computeLedgerPnl(c, vault);
@@ -276,12 +373,18 @@ export function buildReadOnlyTools(ctx) {
     handler: async (args, ctxArg) => {
       const c = ctxArg || ctx;
       if (!isAddressLike(args?.token)) return { ok: false, error: 'invalid token address' };
-      const holders = await c.api.getHolders(args.token, { limit: args.limit || 50 });
+      // getToken (for totalSupplyWei, to compute each holder's pct — see summarizeHolders/
+      // holderPct) is best-effort: a failure never blocks returning the holder list itself, it
+      // just leaves top10Pct at 0 the same as if totalSupplyWei were simply unavailable.
+      const [holders, detail] = await Promise.all([
+        c.api.getHolders(args.token, { limit: args.limit || 50 }),
+        c.api.getToken(args.token).catch(() => null),
+      ]);
       return {
         ok: true,
         token: args.token,
         holders,
-        top10Pct: summarizeHolders(holders, null).top10Pct,
+        top10Pct: summarizeHolders(holders, detail).top10Pct,
         at: new Date().toISOString(),
       };
     },
@@ -304,7 +407,14 @@ function tradeFailure(side, args, error, { clipped = false } = {}) {
  */
 async function executeGuardedTrade(side, args, ctx, chain, guard) {
   try {
-    if (!ctx.vault) return tradeFailure(side, args, 'ctx.vault is not configured');
+    const paperMode = Boolean(ctx.config?.paperMode);
+    // A real vault is required in live mode (it's the only thing that ever gets signed against).
+    // Paper mode never needs one — see buildPaperVaultState below — so this only rejects the live
+    // case; whether ctx.paperEngine itself is wired is still checked lazily, at the point each
+    // paper-mode-only step actually needs it (matches this function's existing "fail where the
+    // dependency is actually used" ordering, unchanged from before this paper-mode-without-a-
+    // vault path existed).
+    if (!paperMode && !ctx.vault) return tradeFailure(side, args, 'ctx.vault is not configured');
     if (!isAddressLike(args?.token)) return tradeFailure(side, args, 'invalid token address');
 
     const primaryField = side === 'buy' ? 'amountInWei' : 'tokensInWei';
@@ -331,9 +441,18 @@ async function executeGuardedTrade(side, args, ctx, chain, guard) {
     }
 
     const quote = await ctx.api.getQuote({ token, side, amountWei: primaryWei.toString() });
-    const priceImpactPct = Number(quote?.priceImpact ?? 0);
+    const priceImpactPct = await computePriceImpactPct(ctx, { side, token, primaryWei, quote });
 
-    const vaultState = await ctx.api.getVault(ctx.vault);
+    // Portfolio sizing context: a real vault read whenever one is configured (live mode always
+    // has one; paper mode may optionally have an unfunded one for extra realism per README), or
+    // — pure paper mode with no vault at all — the PaperEngine's own cash + best-effort-marked
+    // holdings. Nothing paper does ever needs the real vault. (paperMode is guaranteed true here
+    // whenever ctx.vault is falsy — the top-of-function check above already rejected the live+no-
+    // vault case — so an unwired ctx.paperEngine at this point is unambiguously this error.)
+    if (!ctx.vault && !ctx.paperEngine) {
+      return tradeFailure(side, args, 'paper mode requires ctx.paperEngine to be wired');
+    }
+    const vaultState = ctx.vault ? await ctx.api.getVault(ctx.vault) : await buildPaperVaultState(ctx);
     const fullPortfolioQuaiWei = computeFullPortfolioWei(vaultState);
 
     const buildInner = (amt, minOut) =>
@@ -341,14 +460,21 @@ async function executeGuardedTrade(side, args, ctx, chain, guard) {
         ? chain.buildV1BuyCalldata(curveAddress, { amountInWei: amt, minTokensOutWei: minOut })
         : chain.buildV1SellCalldata(curveAddress, { tokensInWei: amt, minQuaiOutWei: minOut });
 
-    const previewOuter = chain.buildVaultExecuteCalldata(ctx.vault, buildInner(primaryWei, minOutWei));
-    const from = await resolveAgentAddress(ctx, chain);
-
+    // Gas estimate: a real preview against the configured vault when one exists — the only way to
+    // get a genuine gas figure, since it depends on the deployed contract actually being called —
+    // or, pure paper mode with nothing to preview against, the documented approximate fallback
+    // above.
     let estimatedGasCostWei;
-    try {
-      estimatedGasCostWei = await chain.estimateGasWei(ctx.provider, { ...previewOuter, from });
-    } catch (err) {
-      return tradeFailure(side, args, `gas estimation failed: ${err?.message ?? err}`);
+    if (ctx.vault) {
+      const previewOuter = chain.buildVaultExecuteCalldata(ctx.vault, buildInner(primaryWei, minOutWei));
+      const from = await resolveAgentAddress(ctx, chain);
+      try {
+        estimatedGasCostWei = await chain.estimateGasWei(ctx.provider, { ...previewOuter, from });
+      } catch (err) {
+        return tradeFailure(side, args, `gas estimation failed: ${err?.message ?? err}`);
+      }
+    } else {
+      estimatedGasCostWei = DEFAULT_PAPER_GAS_ESTIMATE_WEI;
     }
 
     const guardCtx = {
@@ -386,12 +512,24 @@ async function executeGuardedTrade(side, args, ctx, chain, guard) {
     const finalInner = buildInner(finalPrimaryWei, finalMinOutWei);
 
     let txHash = null;
-    if (ctx.config?.paperMode) {
+    // The actual output leg of the fill (tokens received on a buy, QUAI received on a sell) —
+    // additive beyond the pinned {ok,clipped,amountInWei,txHash,warnings} tool-response shape,
+    // surfaced so the decider's own final JSON (DeciderAction.amountOutWei — see
+    // src/agents/schema.mjs) can carry it through to src/runner#buildTradeRecord, which already
+    // knows how to consume it. Without this, every recorded trade's tokens/price came back as 0
+    // (confirmed live: a real paper BUY reported "0 ART out, price: 0 QUAI/token" and left the
+    // ledger position amount at 0 — see INTERFACE-REQUESTS.md's integration entry) since neither
+    // the decider nor src/runner had any other way to learn what was actually filled.
+    let amountOutWei = null;
+    let gasWei = null;
+    if (paperMode) {
       if (!ctx.paperEngine) return tradeFailure(side, args, 'paper mode requires ctx.paperEngine to be wired', { clipped });
       const simResult = side === 'buy'
         ? await ctx.paperEngine.buy(token, finalPrimaryWei, finalMinOutWei)
         : await ctx.paperEngine.sell(token, finalPrimaryWei, finalMinOutWei);
       if (!simResult.ok) return tradeFailure(side, args, simResult.error || 'paper fill rejected', { clipped });
+      const filled = side === 'buy' ? simResult.filledTokensWei : simResult.filledQuaiWei;
+      amountOutWei = (filled ?? 0n).toString();
     } else {
       if (!ctx.wallet) return tradeFailure(side, args, 'live mode requires ctx.wallet', { clipped });
       const sendResult = await chain.sendVaultExecute(ctx.wallet, ctx.vault, finalInner);
@@ -406,9 +544,15 @@ async function executeGuardedTrade(side, args, ctx, chain, guard) {
         };
       }
       txHash = sendResult.txHash;
+      gasWei = sendResult.receipt?.gasUsedWei != null ? sendResult.receipt.gasUsedWei.toString() : null;
+      // amountOutWei stays null for a live fill — this repo has no event-log decoder for the
+      // curve's Buy/Sell event yet, so the real output amount isn't independently knowable here;
+      // fabricating one from a quote would misrepresent an actual on-chain fill. Low priority:
+      // this build never sends a real transaction (see HARD RULES), so the live path is
+      // untested/unexercised regardless.
     }
 
-    return { ok: true, clipped, amountInWei: finalPrimaryWei.toString(), txHash, warnings };
+    return { ok: true, clipped, amountInWei: finalPrimaryWei.toString(), amountOutWei, txHash, gasWei, warnings };
   } catch (err) {
     return tradeFailure(side, args, `unexpected error: ${err?.message ?? err}`);
   }
