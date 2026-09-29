@@ -6,7 +6,9 @@ import {
   buildReadOnlyTools,
   buildTradeTools,
   createMcpServer,
+  appendToolCallLog,
 } from '../src/tools/index.mjs';
+import * as realGuard from '../src/guard/index.mjs';
 
 const TOKEN = '0x00AaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAa';
 const CURVE = '0x00BbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBb';
@@ -401,6 +403,25 @@ test('tools: hartii_buy surfaces a guard rejection as ok:false with the guard re
   assert.equal(result.error, 'price impact too high');
 });
 
+test('tools: hartii_buy with the REAL guard module rejects a minOut=1 bypass now that the quote is wired through (security fix)', async () => {
+  // getQuote (fake api, default): side buy -> amountOut '1000'. A minOut of 1 used to clear
+  // enforceSlippageFloor outright; with the real guard + the quote now threaded into guardCtx, it
+  // must be rejected as below the code-enforced slippage floor.
+  const ctx = { api: makeFakeApi(), config: { paperMode: true }, provider: {}, vault: VAULT, chain: makeFakeChain(), guard: realGuard, paperEngine: { buy: async () => ({ ok: true, filledTokensWei: 1000n }) } };
+  const tools = buildTradeTools(ctx);
+  const result = await findTool(tools, 'hartii_buy').handler({ token: TOKEN, amountInWei: '1000000000000000000', minTokensOutWei: '1' });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /code-enforced/);
+});
+
+test('tools: hartii_buy with the REAL guard module accepts a minOut within tolerance of the live quote', async () => {
+  // amountOut '1000' for a buy -> 5% default tolerance floor is 950.
+  const ctx = { api: makeFakeApi(), config: { paperMode: true }, provider: {}, vault: VAULT, chain: makeFakeChain(), guard: realGuard, paperEngine: { buy: async () => ({ ok: true, filledTokensWei: 1000n }) } };
+  const tools = buildTradeTools(ctx);
+  const result = await findTool(tools, 'hartii_buy').handler({ token: TOKEN, amountInWei: '1000000000000000000', minTokensOutWei: '950' });
+  assert.equal(result.ok, true);
+});
+
 test('tools: hartii_buy returns ok:false when gas estimation throws', async () => {
   const chain = makeFakeChain({ async estimateGasWei() { throw new Error('rpc down'); } });
   const ctx = { api: makeFakeApi(), config: { paperMode: true }, provider: {}, vault: VAULT, chain, guard: makeFakeGuard(), paperEngine: { buy: async () => ({ ok: true }) } };
@@ -602,6 +623,74 @@ test('tools: hartii_launch_token never fabricates a tx even when the gate passes
   assert.equal(result.ok, false);
   assert.equal(result.txHash, null);
   assert.match(result.error, /not yet implemented/);
+});
+
+// --- appendToolCallLog (security fix: real-result log the decider's claims get reconciled against) ---
+
+test('appendToolCallLog: no-ops (never throws) when ctx.toolCallLogPath is unset', async () => {
+  await assert.doesNotReject(() => appendToolCallLog({}, 'buy', { token: TOKEN }, { ok: true }));
+});
+
+test('appendToolCallLog: appends one JSON line with the real result, never the model-proposed args', async () => {
+  const writes = [];
+  const appendFileImpl = async (path, text) => writes.push({ path, text });
+  await appendToolCallLog(
+    { toolCallLogPath: '/fake/tool-calls.jsonl' },
+    'buy',
+    { token: TOKEN, amountInWei: '999999999999999999999' }, // a model could lie in args — never trusted
+    { ok: true, clipped: true, amountInWei: '500000000000000000', amountOutWei: '500', txHash: null, gasWei: '4000000000000000000', warnings: ['clipped'] },
+    { appendFileImpl, nowFn: () => 12345 },
+  );
+  assert.equal(writes.length, 1);
+  assert.equal(writes[0].path, '/fake/tool-calls.jsonl');
+  const entry = JSON.parse(writes[0].text.trim());
+  assert.equal(entry.side, 'buy');
+  assert.equal(entry.token, TOKEN);
+  assert.equal(entry.ok, true);
+  assert.equal(entry.amountInWei, '500000000000000000', 'the REAL clipped amount, not the model-proposed one');
+  assert.equal(entry.amountOutWei, '500');
+  assert.equal(entry.gasWei, '4000000000000000000');
+  assert.deepEqual(entry.warnings, ['clipped']);
+  assert.equal(entry.atMs, 12345);
+});
+
+test('appendToolCallLog: a logging failure never throws (best-effort only)', async () => {
+  await assert.doesNotReject(() =>
+    appendToolCallLog(
+      { toolCallLogPath: '/fake/tool-calls.jsonl' },
+      'sell',
+      { token: TOKEN },
+      { ok: false, error: 'rejected' },
+      { appendFileImpl: async () => { throw new Error('disk full'); } },
+    ),
+  );
+});
+
+test('tools: hartii_buy appends a real-result log line when ctx.toolCallLogPath is wired', async () => {
+  // Wire logging through the real appendToolCallLog default (node:fs/promises#appendFile) by
+  // pointing toolCallLogPath at a real temp file, then read it back.
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const fs = await import('node:fs/promises');
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'hartii-tool-log-test-'));
+  const logPath = path.join(dir, 'tool-calls.jsonl');
+  try {
+    const ctx = {
+      api: makeFakeApi(), config: { paperMode: true }, provider: {}, vault: VAULT, chain: makeFakeChain(),
+      guard: makeFakeGuard(), paperEngine: { buy: async () => ({ ok: true, filledTokensWei: 500n }) },
+      toolCallLogPath: logPath,
+    };
+    const tools = buildTradeTools(ctx);
+    await findTool(tools, 'hartii_buy').handler({ token: TOKEN, amountInWei: '1000000000000000000', minTokensOutWei: '1' });
+    const raw = await fs.readFile(logPath, 'utf8');
+    const entries = raw.trim().split('\n').map((l) => JSON.parse(l));
+    assert.equal(entries.length, 1);
+    assert.equal(entries[0].side, 'buy');
+    assert.equal(entries[0].token, TOKEN);
+    assert.equal(entries[0].ok, true);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });
 
 // --- createMcpServer -------------------------------------------------------------------------

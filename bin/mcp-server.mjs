@@ -38,20 +38,25 @@ import { buildReadOnlyTools, buildTradeTools, createMcpServer, serveStdio, resol
 const MCP_SERVER_NAME = 'hartii-agent'; // must match src/agents#MCP_SERVER_NAME — see header comment above
 
 export function parseArgs(argv) {
-  const args = { help: false, role: null };
+  const args = { help: false, role: null, logFile: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--help' || a === '-h') args.help = true;
     else if (a === '--role') args.role = argv[++i];
+    else if (a === '--log-file') args.logFile = argv[++i];
   }
   return args;
 }
 
 export function printHelp(write = (s) => process.stdout.write(s)) {
-  write(`Usage: node bin/mcp-server.mjs --role <momentumScout|riskAnalyst|portfolioManager|decider>
+  write(`Usage: node bin/mcp-server.mjs --role <momentumScout|riskAnalyst|portfolioManager|decider> [--log-file <path>]
 
 Internal — spawned by src/agents as the MCP server for one sandboxed claude -p session. Not
 meant to be run by hand except to sanity-check the wiring; --help lists this and exits 0.
+--log-file (decider only): an append-only JSON-lines path src/tools#appendToolCallLog writes
+every real hartii_buy/hartii_sell result to, so src/agents#runDecider can reconcile the model's
+own self-reported DeciderResult.actions against what actually happened (see the security fix
+this closes — never trust the decider's claims at face value).
 `);
 }
 
@@ -74,6 +79,7 @@ export async function buildToolCtx({
   walletFactory = (key, provider) => new Wallet(key, provider),
   getAgentKeyMaterialImpl = getAgentKeyMaterial,
   env = process.env,
+  toolCallLogPath = null,
 } = {}) {
   const api = apiFactory({ apiBase: config.apiBase });
   const provider = providerFactory(config.rpcUrl);
@@ -102,6 +108,10 @@ export async function buildToolCtx({
     paperEngine,
     launchState: { count: 0, lastAtMs: null },
     approvedImageUrls: parseApprovedImageUrls(env),
+    // See src/tools#appendToolCallLog / src/agents#reconcileDeciderActions — the real-result log
+    // src/agents' decider session reads back and reconciles its own self-reported actions
+    // against. null for every non-decider role (src/agents never passes --log-file to them).
+    toolCallLogPath,
   };
 }
 
@@ -126,7 +136,7 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
   }
 
   const config = loadConfig(env);
-  const ctx = await buildToolCtx({ config, env });
+  const ctx = await buildToolCtx({ config, env, toolCallLogPath: args.logFile });
   const tools = buildRoleTools(args.role, ctx, config);
   const server = createMcpServer(tools, { name: MCP_SERVER_NAME });
   await serveStdio(server);

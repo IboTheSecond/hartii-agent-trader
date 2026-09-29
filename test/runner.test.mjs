@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { runCycle, runLoop, shouldStop, writeStatus, readStatus, DEFAULT_PAUSE_MIN_MS, DEFAULT_PAUSE_MAX_MS } from '../src/runner/index.mjs';
+import { runCycle, runLoop, shouldStop, writeStatus, readStatus, buildMcpServerEnv, DEFAULT_PAUSE_MIN_MS, DEFAULT_PAUSE_MAX_MS } from '../src/runner/index.mjs';
 import * as realLedgerModule from '../src/ledger/index.mjs';
 
 const QUAI = 10n ** 18n;
@@ -146,6 +146,35 @@ function baseCtx(overrides = {}) {
   return { ctx, reported, io };
 }
 
+// --- buildMcpServerEnv (security fix: role-scoped allowlist, never process.env wholesale) -----
+
+test('buildMcpServerEnv: forwards only the allowlisted non-secret operational vars', () => {
+  const env = { HARTII_API_BASE: 'https://x', HARTII_RPC_URL: 'https://y', SOME_UNRELATED_VAR: 'nope', TELEGRAM_BOT_TOKEN: 'secret', NTFY_URL: 'https://ntfy' };
+  const out = buildMcpServerEnv(env, 'momentumScout', true);
+  assert.equal(out.HARTII_API_BASE, 'https://x');
+  assert.equal(out.HARTII_RPC_URL, 'https://y');
+  assert.equal(out.SOME_UNRELATED_VAR, undefined);
+  assert.equal(out.TELEGRAM_BOT_TOKEN, undefined);
+  assert.equal(out.NTFY_URL, undefined);
+});
+
+test('buildMcpServerEnv: never forwards the agent key to a non-decider role, in either mode', () => {
+  const env = { HARTII_AGENT_KEY: '0xkey', HARTII_AGENT_KEY_FILE: '/path/key' };
+  for (const role of ['momentumScout', 'riskAnalyst', 'portfolioManager']) {
+    for (const paperMode of [true, false]) {
+      const out = buildMcpServerEnv(env, role, paperMode);
+      assert.equal(out.HARTII_AGENT_KEY, undefined, `${role}/paperMode=${paperMode}`);
+      assert.equal(out.HARTII_AGENT_KEY_FILE, undefined, `${role}/paperMode=${paperMode}`);
+    }
+  }
+});
+
+test('buildMcpServerEnv: forwards the agent key to the decider only in live (non-paper) mode', () => {
+  const env = { HARTII_AGENT_KEY: '0xkey' };
+  assert.equal(buildMcpServerEnv(env, 'decider', true).HARTII_AGENT_KEY, undefined);
+  assert.equal(buildMcpServerEnv(env, 'decider', false).HARTII_AGENT_KEY, '0xkey');
+});
+
 // --- runCycle ------------------------------------------------------------------------------
 
 test('runCycle: kill switch short-circuits the whole cycle before any market/agent call', async () => {
@@ -205,7 +234,13 @@ test('runCycle: in paper mode, a trade\'s own reported snapshot reflects the bal
     skipped: null,
   };
   const { ctx, reported, io } = baseCtx({
-    deps: { ledger: realLedgerModule, agents: fakeAgentsModule({ deciderResult: decider }) },
+    // Real ledger transforms (recordTrade/getRecentTrades/etc. — pure, no I/O) are what this test
+    // needs; saveLedger is stubbed out because baseCtx's config.ledgerFile is the literal
+    // production-relative path 'state/ledger.json' — the REAL saveLedger would otherwise write
+    // this test's fixture data over the repo's actual local state/ledger.json on every test run
+    // (found via a real `node bin/run.mjs --paper --once` smoke test after this security-fix
+    // pass: its ledger showed this test's fixture trade instead of the smoke test's own).
+    deps: { ledger: { ...realLedgerModule, saveLedger: async () => {} }, agents: fakeAgentsModule({ deciderResult: decider }) },
   });
 
   await runCycle(ctx);
@@ -262,7 +297,7 @@ test('runCycle: a recordTrade failure does not stop the rest of the cycle from r
   assert.equal(reported.trades.length, 0); // never reported since it was never successfully recorded
 });
 
-test('runCycle: passes process.env as mcpServerEnv so the spawned MCP-server subprocess sees real credentials', async () => {
+test('runCycle: never passes process.env wholesale as mcpServerEnv — only a role-scoped allowlist (security fix)', async () => {
   let analystOpts = null;
   let deciderOpts = null;
   const agents = {
@@ -276,10 +311,51 @@ test('runCycle: passes process.env as mcpServerEnv so the spawned MCP-server sub
       return { actions: [], reasoning: 'x', skipped: 'nothing to do' };
     },
   };
-  const { ctx } = baseCtx({ deps: { agents } });
-  await runCycle(ctx);
-  assert.equal(analystOpts.mcpServerEnv, process.env);
-  assert.equal(deciderOpts.mcpServerEnv, process.env);
+  const prevTelegramToken = process.env.TELEGRAM_BOT_TOKEN;
+  const prevKey = process.env.HARTII_AGENT_KEY;
+  process.env.TELEGRAM_BOT_TOKEN = 'super-secret-telegram-token';
+  process.env.HARTII_AGENT_KEY = `0x${'ab'.repeat(32)}`;
+  try {
+    const { ctx } = baseCtx({ deps: { agents } });
+    await runCycle(ctx);
+
+    // Never the raw process.env object, and never a leak of app secrets an analyst/decider
+    // read-only or paper-mode session has no legitimate need for.
+    assert.notEqual(analystOpts.mcpServerEnv, process.env);
+    assert.notEqual(deciderOpts.mcpServerEnv, process.env);
+    assert.equal(analystOpts.mcpServerEnv.TELEGRAM_BOT_TOKEN, undefined);
+    assert.equal(deciderOpts.mcpServerEnv.TELEGRAM_BOT_TOKEN, undefined);
+    assert.equal(analystOpts.mcpServerEnv.HARTII_AGENT_KEY, undefined, 'a read-only analyst must never see the signing key');
+    // ctx.config.paperMode is true in baseCtx's default fixture — the decider must not get the
+    // key either in paper mode, even though HARTII_AGENT_KEY is set in the real env here.
+    assert.equal(deciderOpts.mcpServerEnv.HARTII_AGENT_KEY, undefined, 'paper mode must never forward a signing key');
+    // Non-secret operational vars a spawned bin/mcp-server.mjs subprocess actually needs are
+    // still forwarded.
+    assert.equal(analystOpts.mcpServerEnv.HARTII_VAULT_ADDRESS, process.env.HARTII_VAULT_ADDRESS);
+  } finally {
+    process.env.TELEGRAM_BOT_TOKEN = prevTelegramToken;
+    process.env.HARTII_AGENT_KEY = prevKey;
+  }
+});
+
+test('runCycle: forwards the agent signing key to the decider only, and only in live mode', async () => {
+  let deciderOpts = null;
+  const agents = {
+    ...fakeAgentsModule(),
+    async runDecider(input, opts) {
+      deciderOpts = opts;
+      return { actions: [], reasoning: 'x', skipped: 'nothing to do' };
+    },
+  };
+  const prevKey = process.env.HARTII_AGENT_KEY;
+  process.env.HARTII_AGENT_KEY = `0x${'cd'.repeat(32)}`;
+  try {
+    const { ctx } = baseCtx({ config: { paperMode: false }, deps: { agents } });
+    await runCycle(ctx);
+    assert.equal(deciderOpts.mcpServerEnv.HARTII_AGENT_KEY, process.env.HARTII_AGENT_KEY);
+  } finally {
+    process.env.HARTII_AGENT_KEY = prevKey;
+  }
 });
 
 test('runCycle: filters out tokens with a blocked status before they ever reach the analysts', async () => {

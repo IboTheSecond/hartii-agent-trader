@@ -2,7 +2,10 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { parseArgs as parseKeygenArgs, printHelp as printKeygenHelp, runKeygenCli, writeKeyFile, grindCyprus1Key, isCyprus1Address } from '../bin/keygen.mjs';
-import { parseArgs as parseRunArgs, printHelp as printRunHelp, buildRunnerCtx, seedPaperLedgerIfFresh } from '../bin/run.mjs';
+import { parseArgs as parseRunArgs, printHelp as printRunHelp, buildRunnerCtx, seedPaperLedgerIfFresh, resolveLockFilePath, acquireRunLock } from '../bin/run.mjs';
+import os from 'node:os';
+import path from 'node:path';
+import { mkdtemp, rm } from 'node:fs/promises';
 import { parseArgs as parseStatusArgs, printHelp as printStatusHelp, runStatusCli } from '../bin/status.mjs';
 import { parseArgs as parseMcpArgs, printHelp as printMcpHelp, buildToolCtx, buildRoleTools } from '../bin/mcp-server.mjs';
 
@@ -177,6 +180,83 @@ test('run: seedPaperLedgerIfFresh is a no-op once any deposit has ever been reco
   assert.equal(ctx.ledger.totalDepositedWei, '5'); // untouched
 });
 
+// --- bin/run.mjs single-instance lock (security fix) --------------------------------------
+
+test('run: resolveLockFilePath places run.lock alongside status.json (same state dir)', () => {
+  const lockPath = resolveLockFilePath({ statusFile: '/repo/state/status.json' });
+  assert.equal(lockPath, path.join('/repo/state', 'run.lock'));
+});
+
+test('run: acquireRunLock creates a fresh lock file containing this process\'s pid', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'hartii-lock-test-'));
+  try {
+    const lockPath = path.join(dir, 'run.lock');
+    const lock = await acquireRunLock(lockPath, { pid: 4242 });
+    const content = await (await import('node:fs/promises')).readFile(lockPath, 'utf8');
+    assert.equal(content, '4242');
+    await lock.release();
+    // release() removes the lock file — a subsequent acquire must succeed cleanly.
+    const lock2 = await acquireRunLock(lockPath, { pid: 4243 });
+    await lock2.release();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('run: acquireRunLock refuses to start a second instance while the first\'s pid is confirmed alive', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'hartii-lock-test-'));
+  try {
+    const lockPath = path.join(dir, 'run.lock');
+    const lock = await acquireRunLock(lockPath, { pid: 111, isPidAliveImpl: async () => true });
+    await assert.rejects(
+      () => acquireRunLock(lockPath, { pid: 222, isPidAliveImpl: async () => true }),
+      /another hartii-agent-trader instance already holds the lock/,
+    );
+    await lock.release();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('run: acquireRunLock reclaims a stale lock (recorded pid no longer alive) instead of refusing to start', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'hartii-lock-test-'));
+  try {
+    const lockPath = path.join(dir, 'run.lock');
+    // A lock "left behind" by a pid that is no longer running.
+    await acquireRunLock(lockPath, { pid: 999, isPidAliveImpl: async () => false });
+    // Never released — simulates a crash. The next acquire must reclaim it, not refuse.
+    const lock2 = await acquireRunLock(lockPath, { pid: 1000, isPidAliveImpl: async () => false });
+    const content = await (await import('node:fs/promises')).readFile(lockPath, 'utf8');
+    assert.equal(content, '1000');
+    await lock2.release();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('run: acquireRunLock treats a corrupt/unreadable lock file as stale rather than refusing forever', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'hartii-lock-test-'));
+  try {
+    const lockPath = path.join(dir, 'run.lock');
+    await (await import('node:fs/promises')).writeFile(lockPath, 'not-a-pid', 'utf8');
+    const lock = await acquireRunLock(lockPath, { pid: 555 });
+    await lock.release();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('run: acquireRunLock creates the parent state directory if it does not exist yet', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'hartii-lock-test-'));
+  try {
+    const lockPath = path.join(dir, 'nested', 'state', 'run.lock');
+    const lock = await acquireRunLock(lockPath, { pid: 1 });
+    await lock.release();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 // --- bin/status.mjs -------------------------------------------------------------------------
 
 test('status: parseArgs reads --file/--help with a sane default', () => {
@@ -204,8 +284,9 @@ test('status: runStatusCli prints a friendly message when no status.json exists 
 
 // --- bin/mcp-server.mjs ---------------------------------------------------------------------
 
-test('mcp-server: parseArgs reads --role/--help', () => {
-  assert.deepEqual(parseMcpArgs(['--role', 'decider']), { help: false, role: 'decider' });
+test('mcp-server: parseArgs reads --role/--log-file/--help', () => {
+  assert.deepEqual(parseMcpArgs(['--role', 'decider']), { help: false, role: 'decider', logFile: null });
+  assert.deepEqual(parseMcpArgs(['--role', 'decider', '--log-file', '/tmp/x.jsonl']), { help: false, role: 'decider', logFile: '/tmp/x.jsonl' });
   assert.equal(parseMcpArgs(['--help']).help, true);
   assert.equal(parseMcpArgs([]).role, null);
 });
@@ -277,6 +358,31 @@ test('mcp-server: buildToolCtx reads HARTII_APPROVED_IMAGE_URLS as a comma-separ
     env: { HARTII_APPROVED_IMAGE_URLS: 'https://a.png, https://b.png' },
   });
   assert.deepEqual(ctx.approvedImageUrls, ['https://a.png', 'https://b.png']);
+});
+
+test('mcp-server: buildToolCtx wires toolCallLogPath through to the ToolCtx (security fix — reconciliation log)', async () => {
+  const config = { paperMode: true, hasAgentKey: false, apiBase: 'https://x', rpcUrl: 'https://y', vaultAddress: null, ledgerFile: 'state/ledger.json' };
+  const ctx = await buildToolCtx({
+    config,
+    apiFactory: () => fakeApi(),
+    providerFactory: () => ({}),
+    loadLedgerImpl: async () => ({ totalDepositedWei: '0', gasSpentWei: '0', positions: {}, trades: [] }),
+    env: {},
+    toolCallLogPath: '/tmp/tool-calls.jsonl',
+  });
+  assert.equal(ctx.toolCallLogPath, '/tmp/tool-calls.jsonl');
+});
+
+test('mcp-server: buildToolCtx defaults toolCallLogPath to null when not passed', async () => {
+  const config = { paperMode: true, hasAgentKey: false, apiBase: 'https://x', rpcUrl: 'https://y', vaultAddress: null, ledgerFile: 'state/ledger.json' };
+  const ctx = await buildToolCtx({
+    config,
+    apiFactory: () => fakeApi(),
+    providerFactory: () => ({}),
+    loadLedgerImpl: async () => ({ totalDepositedWei: '0', gasSpentWei: '0', positions: {}, trades: [] }),
+    env: {},
+  });
+  assert.equal(ctx.toolCallLogPath, null);
 });
 
 test('mcp-server: buildRoleTools filters strictly to that role\'s allowlist (belt-and-braces)', async () => {

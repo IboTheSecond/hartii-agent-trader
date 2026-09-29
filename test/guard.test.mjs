@@ -92,8 +92,39 @@ test('guard: enforceSlippageFloor rejects zero — never silently defaults it', 
   assert.equal(guard.enforceSlippageFloor(0n).ok, false);
 });
 
-test('guard: enforceSlippageFloor accepts any positive floor', () => {
+test('guard: enforceSlippageFloor accepts any positive floor when no quote context is given', () => {
   assert.equal(guard.enforceSlippageFloor(1n).ok, true);
+});
+
+// --- enforceSlippageFloor: code-enforced floor against a live quote (security fix) -----------
+
+test('guard: enforceSlippageFloor rejects a technically-positive minOut that is far below the quote (the exact bypass this closes)', () => {
+  // Old behavior: minOut=1n cleared the guard outright. New behavior: it must still be within
+  // DEFAULT_MAX_SLIPPAGE_BPS of the quoted amount.
+  const result = guard.enforceSlippageFloor(1n, { quotedAmountOutWei: 1000n });
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /code-enforced/);
+});
+
+test('guard: enforceSlippageFloor accepts a minOut within the default 5% slippage tolerance of the quote', () => {
+  // 5% off 1000 = 950 — at or above that must pass.
+  assert.equal(guard.enforceSlippageFloor(950n, { quotedAmountOutWei: 1000n }).ok, true);
+  assert.equal(guard.enforceSlippageFloor(1000n, { quotedAmountOutWei: 1000n }).ok, true);
+});
+
+test('guard: enforceSlippageFloor rejects a minOut just under the code-derived floor', () => {
+  assert.equal(guard.enforceSlippageFloor(949n, { quotedAmountOutWei: 1000n }).ok, false);
+});
+
+test('guard: enforceSlippageFloor respects a custom maxSlippageBps', () => {
+  // 10% tolerance -> floor is 900.
+  assert.equal(guard.enforceSlippageFloor(900n, { quotedAmountOutWei: 1000n, maxSlippageBps: 1000 }).ok, true);
+  assert.equal(guard.enforceSlippageFloor(899n, { quotedAmountOutWei: 1000n, maxSlippageBps: 1000 }).ok, false);
+});
+
+test('guard: enforceSlippageFloor ignores the quote check when quotedAmountOutWei is absent (backward compatible)', () => {
+  assert.equal(guard.enforceSlippageFloor(1n, {}).ok, true);
+  assert.equal(guard.enforceSlippageFloor(1n, { quotedAmountOutWei: 0n }).ok, true); // a zero/unknown quote never fabricates a rejection
 });
 
 // --- enforceLaunchGate -------------------------------------------------------------------------
@@ -215,6 +246,23 @@ test('guardBuy: passes a compliant, in-range size through unclipped', () => {
   assert.equal(result.amountInWei, 200n);
 });
 
+test('guardBuy: rejects the exact minOut=1 bypass once a quotedAmountOutWei is wired through ctx (security fix)', () => {
+  const result = guard.guardBuy(
+    { amountInWei: 200n, minTokensOutWei: 1n, priceImpactPct: 1 },
+    buyCtx({ quotedAmountOutWei: 100000n }),
+  );
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /code-enforced/);
+});
+
+test('guardBuy: accepts a minOut within tolerance of ctx.quotedAmountOutWei', () => {
+  const result = guard.guardBuy(
+    { amountInWei: 200n, minTokensOutWei: 95000n, priceImpactPct: 1 },
+    buyCtx({ quotedAmountOutWei: 100000n }), // 5% default tolerance -> floor 95000
+  );
+  assert.equal(result.ok, true);
+});
+
 test('guardBuy: clips (never rejects) an oversized proposal down to the portfolio cap', () => {
   const result = guard.guardBuy({ amountInWei: 900n, minTokensOutWei: 1n, priceImpactPct: 1 }, buyCtx());
   assert.equal(result.ok, true);
@@ -252,15 +300,34 @@ test('guardSell: rejects an unset slippage floor', () => {
   assert.match(result.reason, /slippage/);
 });
 
+test('guardSell: rejects the exact minOut=1 bypass — the quoted sell value doubles as the slippage reference (security fix)', () => {
+  const result = guard.guardSell(
+    { tokensInWei: 500n, minQuaiOutWei: 1n, priceImpactPct: 1, valueOfProposedWei: 100000n },
+    sellCtx(),
+  );
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /code-enforced/);
+});
+
+test('guardSell: accepts a minOut within tolerance of the quoted sell value', () => {
+  const result = guard.guardSell(
+    { tokensInWei: 500n, minQuaiOutWei: 95000n, priceImpactPct: 1, valueOfProposedWei: 100000n },
+    sellCtx(),
+  );
+  assert.equal(result.ok, true);
+});
+
 test('guardSell: passes a compliant sell through unclipped', () => {
-  const result = guard.guardSell({ tokensInWei: 500n, minQuaiOutWei: 1n, priceImpactPct: 1, valueOfProposedWei: 300n }, sellCtx());
+  // minQuaiOutWei must clear the code-enforced slippage floor (>= 95% of valueOfProposedWei=300 -> 285) too.
+  const result = guard.guardSell({ tokensInWei: 500n, minQuaiOutWei: 290n, priceImpactPct: 1, valueOfProposedWei: 300n }, sellCtx());
   assert.equal(result.ok, true);
   assert.equal(result.clipped, false);
   assert.equal(result.tokensInWei, 500n);
 });
 
 test('guardSell: proportionally clips an oversized sell to the portfolio cap by value', () => {
-  const result = guard.guardSell({ tokensInWei: 1000n, minQuaiOutWei: 1n, priceImpactPct: 1, valueOfProposedWei: 800n }, sellCtx());
+  // minQuaiOutWei must clear the code-enforced slippage floor (>= 95% of valueOfProposedWei=800 -> 760) too.
+  const result = guard.guardSell({ tokensInWei: 1000n, minQuaiOutWei: 770n, priceImpactPct: 1, valueOfProposedWei: 800n }, sellCtx());
   assert.equal(result.ok, true);
   assert.equal(result.clipped, true);
   assert.equal(result.tokensInWei, 500n); // cap is 400/800 of the proposed value -> half the tokens

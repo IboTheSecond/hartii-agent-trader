@@ -48,6 +48,54 @@ export const DEFAULT_MAX_CONSECUTIVE_FAILURES = 3;
 export const DEFAULT_GAS_RESERVE_WEI = 10n * WEI_PER_QUAI; // 10 QUAI gas floor for the agent EOA
 export const DEFAULT_CAPITAL_EXHAUSTED_THRESHOLD_WEI = 2n * WEI_PER_QUAI; // 2 QUAI total vault value
 
+// SECURITY (see the security fix this closes): every sandboxed analyst/decider spawn used to get
+// `mcpServerEnv: process.env` — this repo's ENTIRE process environment, unfiltered — serialized
+// into a plaintext mcp-config.json in the OS temp dir for EVERY cycle, including the three
+// READ-ONLY analyst roles that never need a signing key or the Telegram bot token at all.
+// `buildMcpServerEnv` is the allowlist replacing that: only the non-secret operational vars
+// bin/mcp-server.mjs's own `loadConfig(env)` call needs to reconstruct the same Config this
+// process has, plus HARTII_APPROVED_IMAGE_URLS (read directly off env, not through Config).
+// TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID/NTFY_URL are NEVER forwarded — reporting happens entirely
+// in src/report, driven by this (the runner) process, never inside a sandboxed session. The agent
+// signing key (HARTII_AGENT_KEY/HARTII_AGENT_KEY_FILE) is forwarded ONLY for role === 'decider'
+// in live mode — the only role whose guarded hartii_buy/hartii_sell tools can ever sign a
+// transaction; a read-only analyst role gets it never, regardless of mode.
+const MCP_SERVER_ENV_ALLOWLIST = Object.freeze([
+  'HARTII_API_BASE',
+  'HARTII_RPC_URL',
+  'HARTII_PROFILE',
+  'HARTII_PAPER',
+  'HARTII_DRY_RUN',
+  'HARTII_VAULT_ADDRESS',
+  'HARTII_MAX_PRICE_IMPACT_PCT',
+  'HARTII_LAUNCHES_ENABLED',
+  'HARTII_APPROVED_IMAGE_URLS',
+  'HARTII_MAX_ACTIONS_PER_CYCLE',
+  'HARTII_CYCLE_INTERVAL_MS',
+  'HARTII_STATE_DIR',
+  'HARTII_KILL_SWITCH_FILE',
+]);
+
+/**
+ * Builds the env object for one sandboxed analyst/decider's MCP-server subprocess — never
+ * `process.env` wholesale (see MCP_SERVER_ENV_ALLOWLIST's header comment above).
+ * @param {NodeJS.ProcessEnv} env this process's own env (the source of truth for raw values)
+ * @param {'momentumScout'|'riskAnalyst'|'portfolioManager'|'decider'} role
+ * @param {boolean} paperMode this run's resolved Config.paperMode
+ * @returns {NodeJS.ProcessEnv}
+ */
+export function buildMcpServerEnv(env, role, paperMode) {
+  const out = {};
+  for (const key of MCP_SERVER_ENV_ALLOWLIST) {
+    if (env[key] !== undefined) out[key] = env[key];
+  }
+  if (role === 'decider' && !paperMode) {
+    if (env.HARTII_AGENT_KEY !== undefined) out.HARTII_AGENT_KEY = env.HARTII_AGENT_KEY;
+    if (env.HARTII_AGENT_KEY_FILE !== undefined) out.HARTII_AGENT_KEY_FILE = env.HARTII_AGENT_KEY_FILE;
+  }
+  return out;
+}
+
 function toBigIntSafe(v) {
   try {
     if (v === undefined || v === null) return 0n;
@@ -369,10 +417,15 @@ export async function runCycle(ctx) {
 
     // 4. Analysts, in parallel — each is independently fault-tolerant per INTERFACES.md
     // (src/agents#runAnalystsInParallel never lets one analyst's failure fail the others).
-    // `mcpServerEnv: process.env` — see INTERFACE-REQUESTS.md: src/agents' spawned MCP-server
-    // subprocess (bin/mcp-server.mjs) needs the same HARTII_*/TELEGRAM_*/NTFY_* env this process
-    // has, and src/agents' own default for that option is an EMPTY env object, not "inherit".
-    const proposals = await deps.agents.runAnalystsInParallel({ market, holdings, memorySummary, profile }, { mcpServerEnv: process.env });
+    // mcpServerEnv is a role-scoped ALLOWLIST (see buildMcpServerEnv above), never process.env —
+    // no analyst role (all read-only) ever needs a signing key or the Telegram bot token.
+    // runAnalystsInParallel passes this same opts object to all three (read-only) analyst roles —
+    // buildMcpServerEnv treats every non-'decider' role identically (never the agent key), so one
+    // shared build covers all three.
+    const proposals = await deps.agents.runAnalystsInParallel(
+      { market, holdings, memorySummary, profile },
+      { mcpServerEnv: buildMcpServerEnv(process.env, 'analyst', paperMode) },
+    );
 
     // 5. Decider — reconciles proposals into guarded, already-executed (paper or live,
     // transparently) actions via src/tools. runCycle records and reports the outcome; it never
@@ -387,7 +440,7 @@ export async function runCycle(ctx) {
         profile,
         maxActions: ctx.config.maxActionsPerCycle,
       },
-      { mcpServerEnv: process.env },
+      { mcpServerEnv: buildMcpServerEnv(process.env, 'decider', paperMode) },
     );
 
     // Belt-and-braces cap: never act on more than configured, even if the decider misbehaves.

@@ -7,6 +7,7 @@
 // and get the real modules — see INTERFACE-REQUESTS.md for the note to other module owners.
 
 import { z } from 'zod';
+import { appendFile } from 'node:fs/promises';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import * as defaultChain from '../chain/index.mjs';
@@ -395,6 +396,43 @@ export function buildReadOnlyTools(ctx) {
 
 // --- guarded trade tools -------------------------------------------------------------------
 
+/**
+ * SECURITY (see the security fix this closes): appends the REAL result of one guarded
+ * hartii_buy/hartii_sell call to `ctx.toolCallLogPath` (an append-only JSON-lines file), when
+ * wired — src/agents#runDecider reads this back after the sandboxed decider session exits and
+ * reconciles it against the decider's own self-reported DeciderResult.actions, so a hallucinated
+ * or fabricated claimed action (never actually executed, or actually rejected by the guard) can
+ * never be recorded to the ledger / reported to the owner as a real trade. A logging failure must
+ * never affect the tool's own result — best-effort only.
+ * @param {object} ctx ToolCtx (only `ctx.toolCallLogPath`, when set, is used)
+ * @param {'buy'|'sell'} side
+ * @param {object} args the raw tool-call args (only `args.token` is logged)
+ * @param {object} result the tool's own return value (ok/clipped/amountInWei/amountOutWei/txHash/gasWei/warnings/error)
+ * @param {{ appendFileImpl?: Function, nowFn?: Function }} [io]
+ */
+export async function appendToolCallLog(ctx, side, args, result, { appendFileImpl = appendFile, nowFn = Date.now } = {}) {
+  const logPath = ctx?.toolCallLogPath;
+  if (!logPath) return; // logging is optional — only wired for the decider's own sandboxed session
+  try {
+    const entry = {
+      atMs: nowFn(),
+      side,
+      token: args?.token ?? null,
+      ok: Boolean(result?.ok),
+      clipped: Boolean(result?.clipped),
+      amountInWei: result?.amountInWei ?? null,
+      amountOutWei: result?.amountOutWei ?? null,
+      txHash: result?.txHash ?? null,
+      gasWei: result?.gasWei ?? null,
+      warnings: Array.isArray(result?.warnings) ? result.warnings : [],
+      error: result?.error ?? null,
+    };
+    await appendFileImpl(logPath, `${JSON.stringify(entry)}\n`, 'utf8');
+  } catch {
+    /* logging must never break a real trade result */
+  }
+}
+
 function tradeFailure(side, args, error, { clipped = false } = {}) {
   const amount = side === 'buy' ? args?.amountInWei : args?.tokensInWei;
   return { ok: false, clipped, amountInWei: String(amount ?? '0'), txHash: null, error, warnings: [] };
@@ -477,11 +515,17 @@ async function executeGuardedTrade(side, args, ctx, chain, guard) {
       estimatedGasCostWei = DEFAULT_PAPER_GAS_ESTIMATE_WEI;
     }
 
+    // The live quote's own output leg — this trade's OTHER guard checks (price impact, sizing)
+    // were computed against this same quote, so it also doubles as the slippage floor's
+    // code-enforced reference (see src/guard#enforceSlippageFloor / guardBuy / guardSell).
+    const quotedAmountOutWei = safeBigInt(quote?.amountOut) ?? undefined;
+
     const guardCtx = {
       fullPortfolioQuaiWei,
       estimatedGasCostWei,
       maxPriceImpactPct: resolveMaxPriceImpactPct(ctx),
       maxFractionBps: resolveMaxFractionBps(ctx),
+      quotedAmountOutWei,
     };
 
     const guardResult = side === 'buy'
@@ -502,7 +546,9 @@ async function executeGuardedTrade(side, args, ctx, chain, guard) {
 
     if (clipped && primaryWei > 0n && finalPrimaryWei !== primaryWei) {
       finalMinOutWei = scaleBigInt(minOutWei, finalPrimaryWei, primaryWei);
-      const rescaledCheck = guard.enforceSlippageFloor(finalMinOutWei);
+      const rescaledQuotedAmountOutWei =
+        quotedAmountOutWei !== undefined ? scaleBigInt(quotedAmountOutWei, finalPrimaryWei, primaryWei) : undefined;
+      const rescaledCheck = guard.enforceSlippageFloor(finalMinOutWei, { quotedAmountOutWei: rescaledQuotedAmountOutWei });
       if (!rescaledCheck.ok) {
         return tradeFailure(side, args, 'clipped size no longer clears the slippage floor', { clipped: true });
       }
@@ -609,14 +655,24 @@ export function buildTradeTools(ctx) {
     description:
       'Guarded buy of a HartiiLabs token through the AgentVault. Every proposed size is clipped or rejected by code-level guards before anything is built or sent — a returned amount smaller than requested means the guard clipped it, not an error.',
     inputSchema: { token: z.string(), amountInWei: z.string(), minTokensOutWei: z.string() },
-    handler: (args, ctxArg) => executeGuardedTrade('buy', args, ctxArg || ctx, chain, guard),
+    handler: async (args, ctxArg) => {
+      const c = ctxArg || ctx;
+      const result = await executeGuardedTrade('buy', args, c, chain, guard);
+      await appendToolCallLog(c, 'buy', args, result);
+      return result;
+    },
   };
 
   const sellTool = {
     name: 'hartii_sell',
     description: 'Guarded sell of a HartiiLabs token through the AgentVault. Same guard pipeline as hartii_buy.',
     inputSchema: { token: z.string(), tokensInWei: z.string(), minQuaiOutWei: z.string() },
-    handler: (args, ctxArg) => executeGuardedTrade('sell', args, ctxArg || ctx, chain, guard),
+    handler: async (args, ctxArg) => {
+      const c = ctxArg || ctx;
+      const result = await executeGuardedTrade('sell', args, c, chain, guard);
+      await appendToolCallLog(c, 'sell', args, result);
+      return result;
+    },
   };
 
   const tools = [buyTool, sellTool];

@@ -15,7 +15,7 @@
 // sandboxed session, hand it a prompt and a tool allowlist, and validate what comes back.
 
 import { spawn as nodeSpawn } from 'node:child_process';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile, readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import os from 'node:os';
 import path from 'node:path';
@@ -58,6 +58,113 @@ export const DISALLOWED_BUILTIN_TOOLS = Object.freeze([
 ]);
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+
+// SECURITY (see the security fix this closes): the top-level `claude -p` process this module
+// spawns must never inherit this repo's own business secrets (HARTII_AGENT_KEY[_FILE],
+// TELEGRAM_*, NTFY_URL) — it never needs any of them itself; only the MCP-server subprocess it
+// spawns (via its OWN separately-built, role-scoped env — see buildMcpServerEnv in src/runner)
+// ever touches a key, and only for the decider role in live mode. `childEnv` (opts.childEnv,
+// defaulted here) is deliberately an ALLOWLIST of OS/runtime essentials the `claude` binary
+// itself needs to run and authenticate, never `process.env` wholesale.
+const CHILD_ENV_PASSTHROUGH_NAMES = Object.freeze([
+  'PATH', 'Path', 'HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'SystemRoot', 'SystemDrive',
+  'TEMP', 'TMP', 'ProgramData', 'ComSpec', 'NODE_PATH', 'PATHEXT', 'HOMEDRIVE', 'HOMEPATH',
+]);
+
+/**
+ * The env handed to the top-level `claude -p` process itself (not the MCP-server subprocess it
+ * spawns via --mcp-config, which gets its own separately-built env — see
+ * src/runner#buildMcpServerEnv). Forwards only OS/runtime essentials plus any `ANTHROPIC_*`/
+ * `CLAUDE_*` var (the CLI's own auth/config vars) — never this app's HARTII_*, TELEGRAM_*, or
+ * NTFY_URL secrets, which the `claude` binary itself has no legitimate use for.
+ * @param {NodeJS.ProcessEnv} [env]
+ * @returns {NodeJS.ProcessEnv}
+ */
+export function buildChildEnv(env = process.env) {
+  const out = {};
+  for (const key of CHILD_ENV_PASSTHROUGH_NAMES) {
+    if (env[key] !== undefined) out[key] = env[key];
+  }
+  for (const [key, value] of Object.entries(env)) {
+    if (/^(ANTHROPIC_|CLAUDE_)/i.test(key)) out[key] = value;
+  }
+  return out;
+}
+
+/**
+ * Case-insensitive address equality (checksummed vs. non-checksummed forms of the same address
+ * must still match) — used only by reconcileDeciderActions below.
+ */
+function sameAddress(a, b) {
+  return typeof a === 'string' && typeof b === 'string' && a.toLowerCase() === b.toLowerCase();
+}
+
+/**
+ * SECURITY (see the security fix this closes): the decider's own JSON reply is a self-reported,
+ * un-verified claim — a hallucinating or prompt-manipulated session can fabricate a schema-valid
+ * `ok:true` action that was never actually executed (or that the guard actually rejected). This
+ * cross-checks each claimed action against `toolCallLog` — the REAL, append-only record of what
+ * `bin/mcp-server.mjs`'s own hartii_buy/hartii_sell handlers actually did (see
+ * src/tools#appendToolCallLog), read back from this session's own sandbox after it exits.
+ *
+ * Matching is positional-within-(token,side): the Nth claimed action for a given (token, side)
+ * pairs with the Nth real log entry for that same (token, side), since paper-mode fills carry no
+ * txHash to key off. A claimed action with no matching real log entry is DROPPED — never
+ * recorded/reported — rather than trusted at face value; a matched action has every
+ * outcome-bearing field (ok, amountWei, amountOutWei, txHash, gasWei, warnings) OVERWRITTEN by
+ * the real logged result, so even a matched claim can't misstate what actually happened.
+ * @param {object[]} claimedActions DeciderResult.actions as the model reported them
+ * @param {object[]} toolCallLog real hartii_buy/hartii_sell results, in call order (see
+ *   src/tools#appendToolCallLog for the shape)
+ * @returns {object[]} verified actions only
+ */
+export function reconcileDeciderActions(claimedActions, toolCallLog) {
+  const log = Array.isArray(toolCallLog) ? toolCallLog : [];
+  const used = new Array(log.length).fill(false);
+  const verified = [];
+  for (const claimed of claimedActions || []) {
+    const idx = log.findIndex(
+      (entry, i) => !used[i] && entry?.side === claimed?.side && sameAddress(entry?.token, claimed?.token),
+    );
+    if (idx === -1) continue; // no matching real tool-call result — unverified, drop it
+    used[idx] = true;
+    const real = log[idx];
+    verified.push({
+      ...claimed,
+      ok: Boolean(real.ok),
+      amountWei: real.amountInWei ?? claimed.amountWei,
+      amountOutWei: real.amountOutWei ?? null,
+      txHash: real.txHash ?? null,
+      gasWei: real.gasWei ?? null,
+      warnings: Array.isArray(real.warnings) ? real.warnings : claimed.warnings || [],
+    });
+  }
+  return verified;
+}
+
+/** Tolerant JSONL reader for the tool-call log — never throws; a missing/corrupt log (e.g. a
+ * session that never called a trade tool) simply yields no verified actions. */
+async function readToolCallLog(logPath, readFileImpl = readFile) {
+  if (!logPath) return [];
+  let raw;
+  try {
+    raw = await readFileImpl(logPath, 'utf8');
+  } catch {
+    return [];
+  }
+  return raw
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      try {
+        return JSON.parse(line);
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+}
 
 /** Default command used to start the MCP server subprocess `claude` spawns via --mcp-config.
  * Points at a `bin/mcp-server.mjs` this module does not own and does not create (see
@@ -115,7 +222,9 @@ async function writeMcpConfig({ dir, writeFileImpl = writeFile, mcpServerCommand
       },
     },
   };
-  await writeFileImpl(configPath, JSON.stringify(document, null, 2), 'utf8');
+  // mode 0600: this file may carry the agent signing key (decider, live mode only — see
+  // buildMcpServerEnv) or other operational env — never group/world readable on disk.
+  await writeFileImpl(configPath, JSON.stringify(document, null, 2), { encoding: 'utf8', mode: 0o600 });
   return configPath;
 }
 
@@ -275,19 +384,26 @@ async function spawnSandboxedSession({ role, task, systemPrompt, allowedToolIds,
     mkdtempImpl,
     rmImpl,
     writeFileImpl,
+    readFileImpl,
     mcpServerCommand = 'node',
-    mcpServerArgs = [DEFAULT_MCP_SERVER_ENTRY, '--role', role],
+    mcpServerArgs, // undefined -> computed below once `dir` is known (carries the tool-call log path)
     mcpServerEnv = {},
-    childEnv = process.env,
+    childEnv = buildChildEnv(process.env),
   } = opts;
 
   const { dir, cleanup } = await createSandbox({ sandboxDir, mkdtempImpl, rmImpl });
+  // Only the decider ever calls a guarded trade tool, so only its session gets a tool-call log to
+  // reconcile against (see reconcileDeciderActions above) — read back BEFORE cleanup() removes
+  // the sandbox dir.
+  const toolCallLogPath = role === 'decider' ? path.join(dir, 'tool-calls.jsonl') : null;
+  const resolvedMcpServerArgs =
+    mcpServerArgs ?? [DEFAULT_MCP_SERVER_ENTRY, '--role', role, ...(toolCallLogPath ? ['--log-file', toolCallLogPath] : [])];
   try {
     const mcpConfigPath = await writeMcpConfig({
       dir,
       writeFileImpl,
       mcpServerCommand,
-      mcpServerArgs,
+      mcpServerArgs: resolvedMcpServerArgs,
       mcpServerEnv,
     });
     const argv = buildClaudeArgv({ model, mcpConfigPath, allowedToolIds, systemPrompt });
@@ -305,7 +421,8 @@ async function spawnSandboxedSession({ role, task, systemPrompt, allowedToolIds,
       const detail = stderr ? `: ${stderr.slice(0, 300)}` : '';
       throw new AgentOutputError(role, stdout || stderr, `"${role}" session exited with code ${code}${detail}`);
     }
-    return extractResultText(stdout);
+    const toolCallLog = await readToolCallLog(toolCallLogPath, readFileImpl);
+    return { text: extractResultText(stdout), toolCallLog };
   } finally {
     await cleanup();
   }
@@ -326,7 +443,7 @@ export async function runAnalyst(role, input, opts = {}) {
   const systemPrompt = buildSystemPrompt(role, opts);
   const task = buildAnalystPrompt(role, input);
   const allowedToolIds = buildAllowedToolIds(role);
-  const text = await spawnSandboxedSession({ role, task, systemPrompt, allowedToolIds, opts });
+  const { text } = await spawnSandboxedSession({ role, task, systemPrompt, allowedToolIds, opts });
   return parseAnalystOutput(role, text);
 }
 
@@ -374,6 +491,10 @@ export async function runDecider(input, opts = {}) {
   const systemPrompt = buildSystemPrompt(role, opts);
   const task = buildDeciderPrompt(input);
   const allowedToolIds = buildAllowedToolIds(role, { launchesEnabled: opts.launchesEnabled });
-  const text = await spawnSandboxedSession({ role, task, systemPrompt, allowedToolIds, opts });
-  return parseDeciderOutput(text);
+  const { text, toolCallLog } = await spawnSandboxedSession({ role, task, systemPrompt, allowedToolIds, opts });
+  const parsed = parseDeciderOutput(text);
+  // SECURITY: never trust the decider's own self-reported `actions` at face value — reconcile
+  // against the real hartii_buy/hartii_sell results this session's own sandboxed MCP-server
+  // subprocess actually logged (see reconcileDeciderActions above).
+  return { ...parsed, actions: reconcileDeciderActions(parsed.actions, toolCallLog) };
 }

@@ -15,6 +15,8 @@
 // so a spawned `claude -p` session's own MCP server is expected to read these the same way this
 // process does (loadConfig(process.env)), not receive them relayed through the decider input.
 import { pathToFileURL } from 'node:url';
+import path from 'node:path';
+import { open, readFile as fsReadFile, unlink, mkdir } from 'node:fs/promises';
 import { Wallet } from 'quais';
 
 import { loadConfig, getAgentKeyMaterial } from '../src/config/index.mjs';
@@ -89,6 +91,77 @@ export async function buildRunnerCtx(args, env = process.env) {
   return { config, api, provider, wallet, ledger, reporter };
 }
 
+// SECURITY (see the security fix this closes): nothing previously stopped two `bin/run.mjs`
+// processes (accidental double-start, a supervisor restarting into an already-running instance,
+// a stuck old process not fully reaped) from running concurrently against the same vault/ledger/
+// wallet — each would independently clip its own trade to <=40% of its OWN (potentially stale)
+// portfolio snapshot, so two overlapping processes could together commit well beyond the intended
+// per-cycle risk cap, and the second process to finish its ledger write would silently clobber the
+// first's freshly recorded trade (src/ledger#saveLedger's atomic rename is safe against
+// corruption, but not against two writers racing to be "last"). This lock lives in the same state
+// directory as ledger.json/status.json (derived from config.statusFile, never a separate config
+// field — see resolveLockFilePath), so it's scoped to exactly the state this run touches.
+export function resolveLockFilePath(config) {
+  return path.join(path.dirname(config.statusFile), 'run.lock');
+}
+
+async function isPidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0); // signal 0: no-op existence probe, never actually signals the process
+    return true;
+  } catch (err) {
+    // EPERM: the process exists but we lack permission to signal it — still alive.
+    return err?.code === 'EPERM';
+  }
+}
+
+/**
+ * Exclusive, single-instance lock at `lockFilePath` (O_EXCL create — refuses if another live
+ * instance already holds it) with automatic reclaim of a STALE lock (its recorded PID is no
+ * longer alive — e.g. a crash that never released it). Never used by the unit-tested
+ * buildRunnerCtx/seedPaperLedgerIfFresh path — only main() acquires one, and only against a real
+ * run's own state dir.
+ * @param {string} lockFilePath
+ * @param {{ openImpl?: Function, readFileImpl?: Function, unlinkImpl?: Function, mkdirImpl?: Function, pid?: number, isPidAliveImpl?: Function }} [io]
+ * @returns {Promise<{ release: () => Promise<void> }>}
+ * @throws {Error} when another instance's lock is confirmed still alive
+ */
+export async function acquireRunLock(
+  lockFilePath,
+  { openImpl = open, readFileImpl = fsReadFile, unlinkImpl = unlink, mkdirImpl = mkdir, pid = process.pid, isPidAliveImpl = isPidAlive } = {},
+) {
+  await mkdirImpl(path.dirname(lockFilePath), { recursive: true });
+  let handle;
+  try {
+    handle = await openImpl(lockFilePath, 'wx'); // O_CREAT|O_EXCL|O_WRONLY — atomically fails if it exists
+  } catch (err) {
+    if (err?.code !== 'EEXIST') throw err;
+    let existingPid = null;
+    try {
+      existingPid = Number.parseInt((await readFileImpl(lockFilePath, 'utf8')).trim(), 10);
+    } catch {
+      /* unreadable/corrupt lock file — treated as stale (no confirmable live owner) below */
+    }
+    const alive = Number.isInteger(existingPid) ? await isPidAliveImpl(existingPid) : false;
+    if (alive) {
+      throw new Error(
+        `refusing to start: another hartii-agent-trader instance already holds the lock (pid ${existingPid}, ${lockFilePath}) — ` +
+          'stop that instance first, or delete the lock file if you are certain it is stale.',
+      );
+    }
+    // Stale lock from a dead/unconfirmable process — reclaim it and retry once.
+    await unlinkImpl(lockFilePath).catch(() => {});
+    return acquireRunLock(lockFilePath, { openImpl, readFileImpl, unlinkImpl, mkdirImpl, pid, isPidAliveImpl });
+  }
+  try {
+    await handle.writeFile(String(pid), 'utf8');
+  } finally {
+    await handle.close();
+  }
+  return { release: () => unlinkImpl(lockFilePath).catch(() => {}) };
+}
+
 function stringifyResult(result) {
   return JSON.stringify(result, (_key, value) => (typeof value === 'bigint' ? value.toString() : value), 2);
 }
@@ -136,26 +209,46 @@ export async function main(argv = process.argv.slice(2)) {
 
   const ctx = await buildRunnerCtx(args);
 
-  const seeded = await seedPaperLedgerIfFresh(ctx);
-  if (seeded) {
+  // Single-instance lock — see resolveLockFilePath/acquireRunLock's header comments. Throws (and
+  // this call rejects, caught by the bottom of this file) with a clear message when another live
+  // instance already holds it; never starts a second instance against the same state.
+  const lock = await acquireRunLock(resolveLockFilePath(ctx.config));
+  let released = false;
+  const releaseOnce = async () => {
+    if (released) return;
+    released = true;
+    await lock.release();
+  };
+  const onSignal = (signal) => {
+    releaseOnce().finally(() => process.exit(signal === 'SIGINT' ? 130 : 143));
+  };
+  process.on('SIGINT', () => onSignal('SIGINT'));
+  process.on('SIGTERM', () => onSignal('SIGTERM'));
+
+  try {
+    const seeded = await seedPaperLedgerIfFresh(ctx);
+    if (seeded) {
+      console.log(
+        `hartii-agent-trader: seeded a fresh paper ledger with ${DEFAULT_PAPER_STARTING_QUAI_WEI.toString()} wei starting paper capital (no prior deposits recorded)`,
+      );
+    }
+
     console.log(
-      `hartii-agent-trader: seeded a fresh paper ledger with ${DEFAULT_PAPER_STARTING_QUAI_WEI.toString()} wei starting paper capital (no prior deposits recorded)`,
+      `hartii-agent-trader starting — mode: ${ctx.config.paperMode ? 'PAPER' : 'LIVE'}${ctx.config.dryRun ? ' (dry-run)' : ''}, profile: ${ctx.config.profile}, vault: ${ctx.config.vaultAddress || '(none configured)'}`,
     );
+
+    if (args.once) {
+      const result = await runCycle(ctx);
+      console.log(stringifyResult(result));
+      return result.error ? 1 : 0;
+    }
+
+    // default and --loop both run the continuous loop (--once is the only single-shot mode).
+    await runLoop(ctx);
+    return 0;
+  } finally {
+    await releaseOnce();
   }
-
-  console.log(
-    `hartii-agent-trader starting — mode: ${ctx.config.paperMode ? 'PAPER' : 'LIVE'}${ctx.config.dryRun ? ' (dry-run)' : ''}, profile: ${ctx.config.profile}, vault: ${ctx.config.vaultAddress || '(none configured)'}`,
-  );
-
-  if (args.once) {
-    const result = await runCycle(ctx);
-    console.log(stringifyResult(result));
-    return result.error ? 1 : 0;
-  }
-
-  // default and --loop both run the continuous loop (--once is the only single-shot mode).
-  await runLoop(ctx);
-  return 0;
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

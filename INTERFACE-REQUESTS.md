@@ -403,3 +403,57 @@ resolved every open item above:
    the already-absolute case.
 10. Full suite green (`npm test`). `node bin/run.mjs --paper --once` run for real against the live
     public API + RPC (no key, no transaction) — see git log / session notes for the outcome.
+
+---
+
+## From: security fix pass (2026-09-30)
+
+A pre-publish security review found 4 issues (1 critical, 2 high, 1 medium). All 4 applied:
+
+1. **[critical] Full `process.env` (incl. TELEGRAM_BOT_TOKEN and, if set, the raw
+   HARTII_AGENT_KEY) was being written to a plaintext `mcp-config.json` in the OS temp dir for
+   EVERY sandboxed spawn — including the three READ-ONLY analyst roles, every single cycle.**
+   `src/runner#runCycle` called `runAnalystsInParallel(input, { mcpServerEnv: process.env })` /
+   `runDecider(input, { mcpServerEnv: process.env })`; `src/agents`' own `childEnv` default was
+   also `process.env` (the top-level `claude` process's own env, not just the MCP subprocess's).
+   **Fixed:** `src/runner#buildMcpServerEnv(env, role, paperMode)` — a new export — builds a
+   role-scoped ALLOWLIST (non-secret operational `HARTII_*` vars only); the agent signing key is
+   forwarded only for `role === 'decider'` in live mode, never to a read-only analyst, never in
+   paper mode. `src/agents#buildChildEnv` — also new — does the same for the top-level `claude`
+   process (OS essentials + `ANTHROPIC_*`/`CLAUDE_*` only). `mcp-config.json` is now written mode
+   `0600`. The test that previously asserted `mcpServerEnv === process.env` (documenting the bug)
+   was rewritten to assert the new allowlisted behavior instead.
+2. **[high] `enforceSlippageFloor` only checked minOut was set/positive — never against the live
+   quote it was sized from, so a decider could clear it with e.g. `minOut: "1"`, disabling real
+   slippage protection.** **Fixed:** `enforceSlippageFloor(minOutWei, { quotedAmountOutWei,
+   maxSlippageBps })` (backward compatible — the second arg is optional) now ALSO rejects a
+   minOut below a code-derived floor off the live quote (`guard#DEFAULT_MAX_SLIPPAGE_BPS` = 500 /
+   5% default). `guardBuy`/`guardSell` forward `ctx.quotedAmountOutWei` (buy) /
+   `args.valueOfProposedWei` (sell, already the live sell quote's own output) into this check;
+   `src/tools#executeGuardedTrade` threads the fetched quote's `amountOut` through as
+   `guardCtx.quotedAmountOutWei` (rescaled proportionally on the post-clip rescaled recheck too).
+3. **[high] The decider's own JSON reply (`DeciderResult.actions`) was trusted at face value —
+   never cross-checked against what the guarded MCP tool call actually returned** — a
+   hallucinating or prompt-manipulated session could fabricate a schema-valid `ok:true` action
+   (or one the guard actually rejected) that would still be recorded to the ledger and reported
+   to the owner as a real trade. **Fixed:** `src/tools#appendToolCallLog` (new) has
+   `bin/mcp-server.mjs`'s own `hartii_buy`/`hartii_sell` handlers append every REAL result to an
+   append-only JSON-lines file at `ctx.toolCallLogPath` (wired only for decider-role sessions, via
+   a new `--log-file <path>` flag `src/agents` passes pointing inside that session's own sandbox
+   dir, read back before the sandbox is cleaned up). `src/agents#reconcileDeciderActions` (new,
+   applied automatically inside `runDecider`) cross-checks the decider's claimed actions against
+   that real log — a claimed action with no matching real entry is DROPPED (never
+   recorded/reported); a matched one has every outcome field overwritten by the real result.
+4. **[medium] Nothing stopped two `bin/run.mjs` processes from running concurrently against the
+   same vault/ledger** — each would independently clip its own trade to <=40% of its own
+   (potentially stale) portfolio snapshot, together exceeding the intended per-cycle risk cap,
+   and the second to finish could silently clobber the first's freshly recorded ledger trade.
+   **Fixed:** `bin/run.mjs#acquireRunLock`/`resolveLockFilePath` (new) — an O_EXCL-created
+   `state/run.lock` containing the holder's pid, reclaimed automatically if that pid is no longer
+   alive (stale-crash recovery), refusing to start with a clear error otherwise. Acquired first
+   thing in `main()`, released on normal exit and on SIGINT/SIGTERM.
+
+All 4 fixes covered by new tests (`test/runner.test.mjs`, `test/guard.test.mjs`,
+`test/tools.test.mjs`, `test/agents.test.mjs`, `test/bin.test.mjs`) — see each file's
+"(security fix)"-labeled tests. Full suite green after (`npm test`); `node bin/run.mjs --paper
+--once` re-run for real after.

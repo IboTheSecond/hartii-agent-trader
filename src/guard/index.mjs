@@ -64,13 +64,44 @@ export function enforcePriceImpact(priceImpactPct, { maxPct } = {}) {
   return { ok: true };
 }
 
-/** Rejects an unset or zero slippage floor outright — never silently defaults it. @returns {{ ok: boolean, reason?: string }} */
-export function enforceSlippageFloor(minOutWei) {
+// SECURITY (see the security fix this closes): the max drift, in bps, this harness tolerates
+// between the live quote a trade's guard checks were computed from and the actual on-chain/paper
+// fill, on TOP OF (never instead of) requiring a set, positive minOut. Without this, a decider
+// could clear enforceSlippageFloor with a technically-positive but effectively-unprotected minOut
+// (e.g. "1") — the price-impact ceiling only bounds the QUOTED price vs. spot, not how far price
+// may move between that quote and execution.
+export const DEFAULT_MAX_SLIPPAGE_BPS = 500; // 5%
+
+/**
+ * Rejects an unset or zero slippage floor outright — never silently defaults it. When
+ * `quotedAmountOutWei` is also given (the live quote this trade's other guard checks were
+ * computed from), ALSO rejects a minOut below a code-derived floor
+ * (`quotedAmountOutWei * (1 - maxSlippageBps/10000)`), so a model can no longer satisfy this
+ * guard by proposing a merely-nonzero minOut — the floor itself is code-enforced, never left to
+ * whatever value the model happened to propose.
+ * @param {bigint | string | undefined | null} minOutWei
+ * @param {{ quotedAmountOutWei?: bigint, maxSlippageBps?: number }} [ctx]
+ * @returns {{ ok: boolean, reason?: string }}
+ */
+export function enforceSlippageFloor(minOutWei, { quotedAmountOutWei, maxSlippageBps = DEFAULT_MAX_SLIPPAGE_BPS } = {}) {
   if (minOutWei === undefined || minOutWei === null) {
     return { ok: false, reason: 'slippage floor (minOut) is unset' };
   }
-  if (toBig(minOutWei) <= 0n) {
+  const minOut = toBig(minOutWei);
+  if (minOut <= 0n) {
     return { ok: false, reason: 'slippage floor (minOut) must be greater than zero' };
+  }
+  if (quotedAmountOutWei !== undefined && quotedAmountOutWei !== null) {
+    const quoted = toBig(quotedAmountOutWei);
+    if (quoted > 0n) {
+      const codeFloor = (quoted * BigInt(10000 - maxSlippageBps)) / 10000n;
+      if (minOut < codeFloor) {
+        return {
+          ok: false,
+          reason: `slippage floor (minOut=${minOut.toString()}) is below the code-enforced ${maxSlippageBps / 100}% max-slippage floor (${codeFloor.toString()} wei, off a quoted ${quoted.toString()} wei) — a model-proposed minOut is never trusted on its own`,
+        };
+      }
+    }
   }
   return { ok: true };
 }
@@ -160,7 +191,10 @@ export function guardBuy(args, ctx) {
   const proposed = toBig(args.amountInWei);
   if (proposed <= 0n) return { ok: false, reason: 'zero or negative amount' };
 
-  const slippage = enforceSlippageFloor(args.minTokensOutWei);
+  const slippage = enforceSlippageFloor(args.minTokensOutWei, {
+    quotedAmountOutWei: ctx.quotedAmountOutWei,
+    maxSlippageBps: ctx.maxSlippageBps,
+  });
   if (!slippage.ok) return slippage;
 
   const impact = enforcePriceImpact(args.priceImpactPct, { maxPct: ctx.maxPriceImpactPct });
@@ -197,7 +231,10 @@ export function guardSell(args, ctx) {
   if (tokens <= 0n) return { ok: false, reason: 'zero or negative amount' };
   if (value <= 0n) return { ok: false, reason: 'sell quote returned no value — refusing to guess a size' };
 
-  const slippage = enforceSlippageFloor(args.minQuaiOutWei);
+  // `value` (args.valueOfProposedWei ?? ctx.valueOfProposedWei) IS the live sell quote's QUAI-out
+  // for the full proposed tokensInWei — exactly the "quotedAmountOutWei" this trade's other guard
+  // checks were computed from, so it doubles as the slippage floor's quote reference too.
+  const slippage = enforceSlippageFloor(args.minQuaiOutWei, { quotedAmountOutWei: value, maxSlippageBps: ctx.maxSlippageBps });
   if (!slippage.ok) return slippage;
 
   const impact = enforcePriceImpact(args.priceImpactPct, { maxPct: ctx.maxPriceImpactPct });

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtemp, rm, readFile } from 'node:fs/promises';
+import { mkdtemp, rm, readFile, writeFile } from 'node:fs/promises';
 
 import {
   ROLES,
@@ -16,6 +16,8 @@ import {
   buildAnalystPrompt,
   buildDeciderPrompt,
   buildAllowedToolIds,
+  buildChildEnv,
+  reconcileDeciderActions,
   parseAnalystOutput,
   parseDeciderOutput,
   loadMemoryJournal,
@@ -152,6 +154,88 @@ test('agents: buildAllowedToolIds appends hartii_launch_token to decider only wh
 
 test('agents: buildAllowedToolIds throws on an unknown role', () => {
   assert.throws(() => buildAllowedToolIds('not-a-role'), /no TOOL_ALLOWLISTS entry/);
+});
+
+// --- buildChildEnv (security fix: allowlist, never process.env wholesale) ---------------------
+
+test('buildChildEnv: never forwards this app\'s business secrets to the top-level claude process', () => {
+  const env = { HARTII_AGENT_KEY: '0xkey', TELEGRAM_BOT_TOKEN: 'secret', NTFY_URL: 'https://ntfy', PATH: '/usr/bin' };
+  const out = buildChildEnv(env);
+  assert.equal(out.HARTII_AGENT_KEY, undefined);
+  assert.equal(out.TELEGRAM_BOT_TOKEN, undefined);
+  assert.equal(out.NTFY_URL, undefined);
+  assert.equal(out.PATH, '/usr/bin');
+});
+
+test('buildChildEnv: forwards ANTHROPIC_*/CLAUDE_* auth/config vars and OS essentials', () => {
+  const env = { ANTHROPIC_API_KEY: 'sk-x', CLAUDE_CONFIG_DIR: '/cfg', HOME: '/home/x', RANDOM_UNRELATED: 'nope' };
+  const out = buildChildEnv(env);
+  assert.equal(out.ANTHROPIC_API_KEY, 'sk-x');
+  assert.equal(out.CLAUDE_CONFIG_DIR, '/cfg');
+  assert.equal(out.HOME, '/home/x');
+  assert.equal(out.RANDOM_UNRELATED, undefined);
+});
+
+// --- reconcileDeciderActions (security fix: never trust the decider's self-reported actions) --
+
+const TOKEN_B = '0xabcdefabcdefabcdefabcdefabcdefabcdefabcd';
+
+test('reconcileDeciderActions: drops a claimed action with no matching real tool-call log entry (hallucinated/fabricated)', () => {
+  const claimed = [{ token: TOKEN_A, side: 'buy', amountWei: '999', ok: true, warnings: [] }];
+  assert.deepEqual(reconcileDeciderActions(claimed, []), []);
+});
+
+test('reconcileDeciderActions: keeps a matched action but overwrites every outcome field with the REAL logged result', () => {
+  const claimed = [{ token: TOKEN_A, side: 'buy', amountWei: '999999999999999999', ok: true, warnings: [], reason: 'strong momentum' }];
+  const log = [{ side: 'buy', token: TOKEN_A, ok: true, amountInWei: '500000000000000000', amountOutWei: '500', txHash: null, gasWei: '4000000000000000000', warnings: ['clipped'] }];
+  const [action] = reconcileDeciderActions(claimed, log);
+  assert.equal(action.amountWei, '500000000000000000', 'the real clipped amount, never the model-claimed one');
+  assert.equal(action.amountOutWei, '500');
+  assert.equal(action.gasWei, '4000000000000000000');
+  assert.deepEqual(action.warnings, ['clipped']);
+  assert.equal(action.reason, 'strong momentum', 'non-outcome fields from the decider are preserved');
+});
+
+test('reconcileDeciderActions: an action the guard actually rejected is reconciled to ok:false even if the model claimed ok:true', () => {
+  const claimed = [{ token: TOKEN_A, side: 'buy', amountWei: '1', ok: true, warnings: [] }];
+  const log = [{ side: 'buy', token: TOKEN_A, ok: false, error: 'rejected by guard' }];
+  const [action] = reconcileDeciderActions(claimed, log);
+  assert.equal(action.ok, false);
+});
+
+test('reconcileDeciderActions: matches positionally per (token,side) — a 2nd claim for the same pair pairs with the 2nd real entry', () => {
+  const claimed = [
+    { token: TOKEN_A, side: 'buy', amountWei: 'x', ok: true, warnings: [] },
+    { token: TOKEN_A, side: 'buy', amountWei: 'y', ok: true, warnings: [] },
+  ];
+  const log = [
+    { side: 'buy', token: TOKEN_A, ok: true, amountInWei: '1' },
+    { side: 'buy', token: TOKEN_A, ok: true, amountInWei: '2' },
+  ];
+  const result = reconcileDeciderActions(claimed, log);
+  assert.equal(result.length, 2);
+  assert.equal(result[0].amountWei, '1');
+  assert.equal(result[1].amountWei, '2');
+});
+
+test('reconcileDeciderActions: ignores case in token address matching', () => {
+  const claimed = [{ token: TOKEN_A.toUpperCase(), side: 'sell', amountWei: 'x', ok: true, warnings: [] }];
+  const log = [{ side: 'sell', token: TOKEN_A.toLowerCase(), ok: true, amountInWei: '1' }];
+  assert.equal(reconcileDeciderActions(claimed, log).length, 1);
+});
+
+test('reconcileDeciderActions: never matches across different (token,side) pairs, and unmatched extras are simply unused', () => {
+  const claimed = [{ token: TOKEN_A, side: 'buy', amountWei: 'x', ok: true, warnings: [] }];
+  const log = [
+    { side: 'sell', token: TOKEN_A, ok: true, amountInWei: '1' }, // wrong side
+    { side: 'buy', token: TOKEN_B, ok: true, amountInWei: '2' }, // wrong token
+  ];
+  assert.deepEqual(reconcileDeciderActions(claimed, log), []);
+});
+
+test('reconcileDeciderActions: handles an empty/missing log without throwing', () => {
+  assert.deepEqual(reconcileDeciderActions([{ token: TOKEN_A, side: 'buy', amountWei: '1', ok: true, warnings: [] }], undefined), []);
+  assert.deepEqual(reconcileDeciderActions([], []), []);
 });
 
 // --- prompt builders (pure) ---------------------------------------------------------------------
@@ -523,6 +607,92 @@ test('agents: runDecider includes hartii_launch_token only when launchesEnabled 
   });
   const allowedIdx = captured.args.indexOf('--allowedTools');
   assert.ok(captured.args[allowedIdx + 1].split(',').includes(`mcp__${MCP_SERVER_NAME}__hartii_launch_token`));
+});
+
+test('agents: runDecider end-to-end drops a claimed action with no real tool-call log backing it (security fix)', async () => {
+  // The session's own MCP-server subprocess (bin/mcp-server.mjs, faked here) never wrote a
+  // tool-calls.jsonl — the decider's claimed action must be dropped, never trusted at face value.
+  const deciderJson = JSON.stringify({
+    actions: [{ token: TOKEN_A, side: 'buy', amountWei: '999', txHash: TX_HASH, ok: true, warnings: [] }],
+    reasoning: 'strong momentum',
+    skipped: null,
+  });
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'hartii-agent-test-'));
+  try {
+    const result = await runDecider(baseDeciderInput, {
+      spawnImpl: spawnThatSucceeds(envelope(deciderJson)),
+      sandboxDir: dir,
+    });
+    assert.deepEqual(result.actions, []);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('agents: runDecider end-to-end keeps a claimed action once the real tool-call log backs it, overwriting fields with the real result', async () => {
+  const deciderJson = JSON.stringify({
+    actions: [{ token: TOKEN_A, side: 'buy', amountWei: '999999999999999999', txHash: TX_HASH, ok: true, warnings: [], reason: 'strong momentum' }],
+    reasoning: 'strong momentum',
+    skipped: null,
+  });
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'hartii-agent-test-'));
+  try {
+    const realLogEntry = { side: 'buy', token: TOKEN_A, ok: true, amountInWei: '500000000000000000', amountOutWei: '500', txHash: null, gasWei: '4000000000000000000', warnings: [] };
+    const spawnImpl = (command, args) => {
+      const child = fakeChild();
+      queueMicrotask(async () => {
+        // bin/mcp-server.mjs's hartii_buy handler would have appended this itself, via
+        // src/tools#appendToolCallLog, to the --log-file path src/agents wired through.
+        const logIdx = args.indexOf('--mcp-config');
+        void logIdx; // the log path lives inside mcp-config.json's mcpServers.hartii-agent.args
+        await writeFile(path.join(dir, 'tool-calls.jsonl'), `${JSON.stringify(realLogEntry)}\n`, 'utf8');
+        child.stdout.emit('data', Buffer.from(envelope(deciderJson), 'utf8'));
+        child.emit('close', 0);
+      });
+      return child;
+    };
+    const result = await runDecider(baseDeciderInput, { spawnImpl, sandboxDir: dir });
+    assert.equal(result.actions.length, 1);
+    assert.equal(result.actions[0].amountWei, '500000000000000000', 'the real logged amount, never the model-claimed one');
+    assert.equal(result.actions[0].amountOutWei, '500');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('agents: runDecider wires --log-file into the MCP server args, pointing inside this session\'s own sandbox', async () => {
+  let captured = null;
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'hartii-agent-test-'));
+  try {
+    await runDecider(baseDeciderInput, {
+      spawnImpl: spawnThatSucceeds(envelope(JSON.stringify({ actions: [], reasoning: 'x', skipped: 'nothing to do' })), { captureArgs: (c) => { captured = c; } }),
+      sandboxDir: dir,
+    });
+    const mcpConfigIdx = captured.args.indexOf('--mcp-config');
+    const mcpConfigDoc = JSON.parse(await readFile(captured.args[mcpConfigIdx + 1], 'utf8'));
+    const serverArgs = mcpConfigDoc.mcpServers[MCP_SERVER_NAME].args;
+    const logFileIdx = serverArgs.indexOf('--log-file');
+    assert.ok(logFileIdx !== -1, 'decider sessions must wire --log-file so bin/mcp-server.mjs can append real results');
+    assert.equal(path.dirname(serverArgs[logFileIdx + 1]), captured.options.cwd, 'the log lives inside this session\'s own sandbox dir');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('agents: runAnalyst (read-only role) never wires --log-file — only the decider ever calls a trade tool', async () => {
+  let captured = null;
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'hartii-agent-test-'));
+  try {
+    await runAnalyst('momentumScout', baseAnalystInput, {
+      spawnImpl: spawnThatSucceeds(envelope('[]'), { captureArgs: (c) => { captured = c; } }),
+      sandboxDir: dir,
+    });
+    const mcpConfigIdx = captured.args.indexOf('--mcp-config');
+    const mcpConfigDoc = JSON.parse(await readFile(captured.args[mcpConfigIdx + 1], 'utf8'));
+    assert.ok(!mcpConfigDoc.mcpServers[MCP_SERVER_NAME].args.includes('--log-file'));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test('agents: runDecider throws AgentOutputError rather than ever fabricating an action on bad output', async () => {

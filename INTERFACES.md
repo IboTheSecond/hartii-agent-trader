@@ -344,8 +344,14 @@ export function enforceGasFloor(valueWei: bigint, { estimatedGasCostWei: bigint,
 
 export function enforcePriceImpact(priceImpactPct: number, { maxPct: number }) -> { ok: boolean, reason?: string }
 
-/** Rejects an unset or zero slippage floor outright — never silently defaults it. */
-export function enforceSlippageFloor(minOutWei: bigint | undefined | null) -> { ok: boolean, reason?: string }
+/** Rejects an unset or zero slippage floor outright — never silently defaults it. The optional
+ * second arg lets a caller pass the live quote's own output leg (`quotedAmountOutWei`), in which
+ * case minOut is ALSO rejected below a code-derived floor (`quotedAmountOutWei * (1 -
+ * maxSlippageBps/10000)`, default `maxSlippageBps` = `guard#DEFAULT_MAX_SLIPPAGE_BPS` = 500 /
+ * 5%) — closes the gap where a model could otherwise clear this guard with a merely-nonzero
+ * minOut. Backward compatible: omitting the second arg preserves the original unset/zero-only
+ * check. */
+export function enforceSlippageFloor(minOutWei: bigint | string | undefined | null, ctx?: { quotedAmountOutWei?: bigint, maxSlippageBps?: number }) -> { ok: boolean, reason?: string }
 
 export function enforceLaunchGate({ launchesEnabled: boolean, launchCountSession: number, lastLaunchAtMs: number | null, nowMs: number, minIntervalMs?: number, maxPerSession?: number, imageUrl: string, approvedImageUrls: string[] }) -> { ok: boolean, reason?: string }
 
@@ -359,9 +365,12 @@ export async function checkKillSwitch(killSwitchFile: string, existsImpl = fsExi
 
 export function enforceGasReserve(gasQuaiWei: bigint, thresholdWei: bigint) -> { ok: boolean, reason?: string }
 
-/** Composition entry points used by src/tools' guarded MCP handlers. */
-export function guardBuy(args: { amountInWei: bigint, minTokensOutWei: bigint, priceImpactPct: number }, ctx: { fullPortfolioQuaiWei: bigint, estimatedGasCostWei: bigint, maxPriceImpactPct: number, maxFractionBps?: number }) -> GuardDecision
-export function guardSell(args: { tokensInWei: bigint, minQuaiOutWei: bigint, priceImpactPct: number, valueOfProposedWei: bigint }, ctx: { fullPortfolioQuaiWei: bigint, estimatedGasCostWei: bigint, maxPriceImpactPct: number, maxFractionBps?: number }) -> GuardDecision
+/** Composition entry points used by src/tools' guarded MCP handlers. `ctx.quotedAmountOutWei`
+ * (guardBuy) / `args.valueOfProposedWei` (guardSell, already required) double as the live-quote
+ * reference `enforceSlippageFloor` code-enforces the model's minOut against — see that function's
+ * updated signature above. */
+export function guardBuy(args: { amountInWei: bigint, minTokensOutWei: bigint, priceImpactPct: number }, ctx: { fullPortfolioQuaiWei: bigint, estimatedGasCostWei: bigint, maxPriceImpactPct: number, maxFractionBps?: number, quotedAmountOutWei?: bigint, maxSlippageBps?: number }) -> GuardDecision
+export function guardSell(args: { tokensInWei: bigint, minQuaiOutWei: bigint, priceImpactPct: number, valueOfProposedWei: bigint }, ctx: { fullPortfolioQuaiWei: bigint, estimatedGasCostWei: bigint, maxPriceImpactPct: number, maxFractionBps?: number, maxSlippageBps?: number }) -> GuardDecision
 
 type GuardDecision =
   | { ok: true, clipped: boolean, reason?: string, amountInWei?: bigint, tokensInWei?: bigint }
@@ -471,6 +480,14 @@ export const TOOL_ALLOWLISTS: {
  * TOOL_ALLOWLISTS[role] directly. */
 export function resolveAllowlist(role: string, config: { launchesEnabled?: boolean }) -> string[]
 
+/** SECURITY: appends the REAL result of one hartii_buy/hartii_sell call to
+ * `ctx.toolCallLogPath` (when wired — decider-role sessions only), as one JSON line. This is the
+ * ground truth `src/agents#reconcileDeciderActions` reads back after the sandboxed decider
+ * session exits, so a hallucinated/fabricated self-reported action can never be recorded to the
+ * ledger or reported to the owner. Best-effort — a logging failure never affects the tool's own
+ * result. */
+export async function appendToolCallLog(ctx: ToolCtx, side: 'buy' | 'sell', args: object, result: object, io?: { appendFileImpl?: Function, nowFn?: Function }) -> Promise<void>
+
 type ToolCtx = {
   api: ApiClient, provider, wallet: Wallet | null, vault: string | null, config: Config,
   // Optional — every field below degrades gracefully (documented per-field) rather than
@@ -489,6 +506,7 @@ type ToolCtx = {
   guard?: typeof import('../guard/index.mjs'),  // test-only DI seam; real module when omitted.
   launchState?: { count: number, lastAtMs: number | null },
   approvedImageUrls?: string[],
+  toolCallLogPath?: string | null,  // decider-role sessions only — see appendToolCallLog below.
 };
 type ToolDef = { name: string, description: string, inputSchema: object, handler: (args, ctx) => Promise<object> };
 ```
@@ -542,8 +560,22 @@ export async function runAnalyst(role: typeof ROLES[number], input: AnalystInput
 export async function runAnalystsInParallel(input: AnalystInput, opts?) -> Promise<Record<typeof ROLES[number], AnalystProposal[]>>
 
 /** Spawns the decider with the guarded trade tools; reconciles proposals into 1-3 executed (or
- * paper-executed) actions via src/tools' guarded handlers. */
+ * paper-executed) actions via src/tools' guarded handlers. The returned `DeciderResult.actions`
+ * is ALREADY reconciled against the session's own real tool-call log (see
+ * `reconcileDeciderActions` below) — never the model's raw self-reported claims. */
 export async function runDecider(input: DeciderInput, opts: { model?: string, timeoutMs?: number, spawnImpl? } = {}) -> Promise<DeciderResult>
+
+/** SECURITY: cross-checks the decider's self-reported `actions` against `toolCallLog` (real
+ * hartii_buy/hartii_sell results, read back from `--log-file` after the session exits) — an
+ * unmatched claimed action is dropped; a matched one has every outcome field (ok, amountWei,
+ * amountOutWei, txHash, gasWei, warnings) overwritten by the real result. Exported for direct
+ * unit testing; `runDecider` already applies it. */
+export function reconcileDeciderActions(claimedActions: DeciderResult['actions'], toolCallLog: object[]) -> DeciderResult['actions']
+
+/** The env for the top-level `claude -p` process itself (opts.childEnv's default) — an
+ * ALLOWLIST of OS/runtime essentials plus any `ANTHROPIC_*`/`CLAUDE_*` var, never this repo's
+ * HARTII_*/TELEGRAM_*/NTFY_URL secrets and never `process.env` wholesale. */
+export function buildChildEnv(env?: NodeJS.ProcessEnv) -> NodeJS.ProcessEnv
 
 export function buildAnalystPrompt(role: typeof ROLES[number], input: AnalystInput) -> string
 export function buildDeciderPrompt(input: DeciderInput) -> string
@@ -617,6 +649,15 @@ export async function shouldStop(ctx: RunnerCtx) -> Promise<{ stop: boolean, rea
 export async function writeStatus(filePath: string, status: Status, writeImpl?) -> Promise<void>
 export async function readStatus(filePath: string, readImpl?) -> Promise<Status | null>
 
+/** SECURITY: builds the role-scoped env allowlist `runCycle` passes as `opts.mcpServerEnv` to
+ * `src/agents#runAnalystsInParallel`/`runDecider` — NEVER `process.env` wholesale (see the
+ * security fix this closes: every spawn used to serialize this repo's entire environment,
+ * TELEGRAM_BOT_TOKEN/NTFY_URL/the raw agent key included, into a plaintext mcp-config.json for
+ * every read-only analyst too). Forwards only the non-secret operational vars
+ * `bin/mcp-server.mjs`'s own `loadConfig(env)` needs; the agent signing key is included only for
+ * `role === 'decider'` in live (non-paper) mode. */
+export function buildMcpServerEnv(env: NodeJS.ProcessEnv, role: string, paperMode: boolean) -> NodeJS.ProcessEnv
+
 type RunnerCtx = { config: Config, api: ApiClient, provider, wallet: Wallet | null, ledger: Ledger, reporter: Reporter };
 type CycleResult = { cycleId: string, atMs: number, decider: DeciderResult, stopped: boolean, stopReason?: string };
 type Status = { lastCycleAtMs: number, cyclesRun: number, paperMode: boolean, portfolio: { quaiWei: string, totalValueWei: string }, realizedPnlWei: string, growthPct: number, lastError: string | null };
@@ -687,8 +728,21 @@ type ReplayResult = { trades: TradeRecord[], finalState: { quaiWei: bigint, posi
 - **`bin/run.mjs`** — CLI flags: `--once` (single cycle, exit), `--loop` (default interval loop),
   `--paper` (force paper mode), `--live` (required together with real keys to ever send a
   transaction), `--dry-run` (build+log calldata, never send). Wires `src/config` ->
-  `src/data`/`src/chain` -> `src/tools` -> `src/agents` -> `src/runner`.
+  `src/data`/`src/chain` -> `src/tools` -> `src/agents` -> `src/runner`. Acquires an exclusive
+  single-instance lock (`acquireRunLock`/`resolveLockFilePath`, `state/run.lock` — O_EXCL create,
+  reclaims a stale lock whose recorded pid is no longer alive) before doing anything else, and
+  refuses to start with a clear error if another live instance already holds it; released on
+  normal exit and on SIGINT/SIGTERM.
 - **`bin/status.mjs`** — reads and pretty-prints `state/status.json` (via `src/runner#readStatus`).
+- **`bin/mcp-server.mjs`** — the actual MCP server subprocess `src/agents` spawns (over stdio) for
+  every sandboxed analyst/decider session: `node bin/mcp-server.mjs --role <role> [--log-file
+  <path>]`. Builds a `ToolCtx`, filters `buildReadOnlyTools`/`buildTradeTools` to
+  `resolveAllowlist(role, config)`, serves it via `createMcpServer` + `serveStdio`.
+  `--log-file` (decider only, wired by `src/agents`) is the path `src/tools#appendToolCallLog`
+  appends every real `hartii_buy`/`hartii_sell` result to, as an append-only JSON-lines file —
+  the real-result log `src/agents#reconcileDeciderActions` reads back and reconciles the
+  decider's own self-reported `DeciderResult.actions` against (an unmatched claimed action is
+  dropped, never recorded/reported at face value).
 
 ---
 
