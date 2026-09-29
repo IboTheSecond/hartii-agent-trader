@@ -1,0 +1,23 @@
+{
+  "name": "hartii-agent-trader",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "license": "MIT",
+  "description": "Open-source autonomous multi-agent AI trading harness for HartiiLabs memecoins on Quai Network, trading through an on-chain AgentVault via the public hartiilabs.com HTTP API. Paper mode by default; live trading requires explicit env-provided keys and passes through code-level + on-chain guards.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test",
+    "start": "node bin/run.mjs --loop"
+  },
+  "bin": {
+    "hartii-agent-trader": "./bin/run.mjs"
+  },
+  "dependencies": {
+    "quais": "1.0.0-alpha.54",
+    "@modelcontextprotocol/sdk": "1.30.1",
+    "zod": "4.6.5"
+  }
+}

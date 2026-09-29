@@ -1,0 +1,20 @@
+# secrets
+.env
+.env.*
+!.env.example
+*.key
+*.key.json
+
+# runtime / local state (never committed — trade ledger, memory journal, kill switch, etc.)
+state/
+logs/
+sandbox/
+
+# deps
+node_modules/
+
+# misc
+.DS_Store
+Thumbs.db
+*.log
+npm-debug.log*
