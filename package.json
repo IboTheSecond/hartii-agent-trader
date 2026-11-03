@@ -18,6 +18,6 @@
   "dependencies": {
     "quais": "1.0.0-alpha.54",
     "@modelcontextprotocol/sdk": "1.31.0",
-    "zod": "4.6.5"
+    "zod": "4.6.7"
   }
 }
